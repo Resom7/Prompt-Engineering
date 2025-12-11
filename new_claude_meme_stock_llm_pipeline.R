@@ -76,11 +76,12 @@ if (!file.exists(llm_prompt_template_file)) {
   # Create default template (students will refine this)
   default_prompt <- 'You are an expert financial sentiment analyst specializing in social media analysis of meme stocks.
 
-Analyze the following Reddit post and return ONLY a valid JSON object with sentiment scores.
+Analyze the following Reddit post, identify stock tickers mentioned (including company names), and return ONLY a valid JSON object with tickers and sentiment scores.
 
 Return exactly this JSON structure with numeric values in [-1.0000, 1.0000] and binary flags (0 or 1):
 
 {
+  "tickers": "",
   "sent_hype": 0.0000,
   "sent_fomo": 0.0000,
   "sent_fear": 0.0000,
@@ -94,6 +95,9 @@ Return exactly this JSON structure with numeric values in [-1.0000, 1.0000] and 
   "has_diamond_emoji": 0,
   "has_money_emoji": 0
 }
+
+For tickers: Look for ticker symbols (GME, AMC) or company names (GameStop = GME, Tesla = TSLA).
+If multiple tickers found, separate with commas (e.g., "GME,AMC"). If none found, use empty string "".
 
 POST TEXT:
 {POST_TEXT}
@@ -148,11 +152,15 @@ load_and_clean_reddit <- function(file_path = "dataset_meme_reddit_historical_1.
       text = paste(title, selftext, sep = "\n\n")
     )
 
-  # Filter short/empty posts
+  # Filter only removed/deleted and truly empty posts
+  # Let the LLM decide if a post contains ticker information
   df <- df %>%
-    filter(nchar(text) >= min_text_length)
+    filter(
+      nchar(text) >= min_text_length,
+      !grepl("\\[removed\\]|\\[deleted\\]", text, ignore.case = TRUE)
+    )
 
-  message(glue("  After removing short posts: {nrow(df)} posts"))
+  message(glue("  After removing removed/deleted/empty posts: {nrow(df)} posts"))
 
   # Optional: filter to target subreddits
   if (!is.null(target_subreddits)) {
@@ -201,30 +209,88 @@ extract_tickers <- function(text, tradeable_tickers) {
   return(valid_tickers)
 }
 
-#' Extract tickers from all posts and unnest to post-ticker pairs
+#' Extract tickers from LLM-scored posts and validate against price data
 #'
-#' @param df_posts Tibble of posts with 'text' column
-#' @param tradeable_tickers Character vector of valid tickers
+#' This function validates LLM-extracted tickers by checking if they exist
+#' in the price dataset ON THE SAME DATE as the Reddit post. This ensures
+#' we only keep tickers that were in the top-N volatile stocks on that day.
+#'
+#' @param df_posts_scored Tibble of posts with 'tickers' and 'date' columns
+#' @param df_price Tibble of price data (already filtered to top-N per day)
 #' @return Tibble with one row per (post_id, ticker) pair
-extract_and_unnest_tickers <- function(df_posts, tradeable_tickers) {
+extract_and_unnest_tickers <- function(df_posts_scored, df_price) {
 
-  message("Extracting tickers from posts...")
+  message("Processing LLM-extracted tickers from scored posts...")
 
-  df_posts <- df_posts %>%
-    mutate(tickers = map(text, ~extract_tickers(.x, tradeable_tickers)))
+  # Get valid (ticker, date) pairs from price data
+  valid_ticker_dates <- df_price %>%
+    select(ticker, date) %>%
+    distinct()
+
+  # Process tickers column: split comma-separated tickers and validate by date
+  df_posts_scored <- df_posts_scored %>%
+    mutate(
+      # Handle NA, empty strings, and split comma-separated tickers
+      ticker_list = map2(tickers, date, function(ticker_str, post_date) {
+        if (is.na(ticker_str) || ticker_str == "") {
+          return(character(0))
+        }
+        # Split by comma and trim whitespace
+        tickers_split <- str_split(ticker_str, ",")[[1]] %>%
+          str_trim() %>%
+          str_to_upper()
+
+        # Filter to only tickers that exist in price data on this date
+        valid <- tickers_split[tickers_split %in%
+          (valid_ticker_dates %>%
+             filter(date == post_date) %>%
+             pull(ticker))]
+
+        return(valid)
+      })
+    )
 
   # Count posts with tickers
-  n_with_tickers <- sum(map_int(df_posts$tickers, length) > 0)
-  message(glue("  Posts mentioning valid tickers: {n_with_tickers}"))
+  n_with_tickers <- sum(map_int(df_posts_scored$ticker_list, length) > 0)
+  message(glue("  Posts with valid LLM-extracted tickers: {n_with_tickers}"))
 
-  # Unnest to post-ticker level and rename column
-  df_posts_ticker <- df_posts %>%
-    filter(map_int(tickers, length) > 0) %>%
-    unnest(tickers, names_repair = "check_unique") %>%
-    rename(ticker = tickers)  # Rename tickers (plural) to ticker (singular)
+  # Debug: Show which tickers were extracted vs which are tradeable
+  if (n_with_tickers == 0) {
+    # Count raw ticker extractions (before validation)
+    raw_tickers <- df_posts_scored %>%
+      filter(!is.na(tickers) & tickers != "") %>%
+      pull(tickers) %>%
+      str_split(",") %>%
+      unlist() %>%
+      str_trim() %>%
+      str_to_upper() %>%
+      unique()
+
+    if (length(raw_tickers) > 0) {
+      message("  WARNING: LLM extracted tickers, but NONE were in top-N volatile on their post dates!")
+      message(glue("  LLM extracted {length(raw_tickers)} unique ticker(s): {paste(head(raw_tickers, 20), collapse=', ')}"))
+
+      # Sample check: show some post dates
+      sample_dates <- df_posts_scored %>%
+        filter(!is.na(date)) %>%
+        pull(date) %>%
+        unique() %>%
+        head(5)
+      message(glue("  Sample post dates: {paste(sample_dates, collapse=', ')}"))
+    } else {
+      message("  LLM did not extract any ticker strings from the posts.")
+    }
+  }
+
+  # Unnest to post-ticker level
+  df_posts_ticker <- df_posts_scored %>%
+    filter(map_int(ticker_list, length) > 0) %>%
+    select(-tickers) %>%  # Remove original tickers column before unnesting
+    unnest(ticker_list, names_repair = "check_unique") %>%
+    rename(ticker = ticker_list)  # Rename ticker_list to ticker
 
   message(glue("  Total post-ticker pairs: {nrow(df_posts_ticker)}"))
-  message("Ticker extraction complete")
+  message("LLM ticker extraction and unnesting complete")
 
   return(df_posts_ticker)
 }
@@ -270,7 +336,7 @@ call_chatgpt_raw <- function(messages,
       timeout(30)
     )
   }, error = function(e) {
-    warning("HTTP request failed: ", e$message)
+    message("HTTP request failed: ", e$message)
     return(NULL)
   })
 
@@ -278,7 +344,20 @@ call_chatgpt_raw <- function(messages,
 
   # Check status
   if (status_code(response) != 200) {
-    warning("API returned status ", status_code(response))
+    # Get error message from response
+    error_content <- tryCatch({
+      content(response, "parsed", type = "application/json")
+    }, error = function(e) NULL)
+
+    error_msg <- if (!is.null(error_content$error$message)) {
+      error_content$error$message
+    } else if (!is.null(error_content)) {
+      paste("API returned:", toJSON(error_content, auto_unbox = TRUE))
+    } else {
+      paste("HTTP status", status_code(response))
+    }
+
+    warning(sprintf("API error (status %d): %s", status_code(response), error_msg))
     return(NA_character_)
   }
 
@@ -328,7 +407,8 @@ build_llm_messages <- function(text, prompt_template = llm_prompt_template) {
 score_post_with_llm <- function(text,
                                  api_key,
                                  base_url,
-                                 prompt_template = llm_prompt_template) {
+                                 prompt_template = llm_prompt_template,
+                                 debug = FALSE) {
 
   # Truncate very long posts (GPT-4o-mini has token limits)
   if (nchar(text) > 3000) {
@@ -338,6 +418,12 @@ score_post_with_llm <- function(text,
   # Build messages
   messages <- build_llm_messages(text, prompt_template)
 
+  # Debug output
+  if (debug) {
+    message("\n=== DEBUG: LLM API Call ===")
+    message("Post text (first 200 chars): ", substr(text, 1, 200))
+  }
+
   # Call API
   response_text <- call_chatgpt_raw(
     messages = messages,
@@ -346,8 +432,16 @@ score_post_with_llm <- function(text,
     base_url = base_url
   )
 
+  # Debug output
+  if (debug && !is.na(response_text)) {
+    message("API response: ", substr(response_text, 1, 300))
+  } else if (debug) {
+    message("API response: NA (failed)")
+  }
+
   # Default scores (if parsing fails)
   default_scores <- tibble(
+    tickers = NA_character_,
     sent_hype = NA_real_,
     sent_fomo = NA_real_,
     sent_fear = NA_real_,
@@ -380,6 +474,7 @@ score_post_with_llm <- function(text,
 
     # Convert to tibble with expected columns
     tibble(
+      tickers = as.character(if (!is.null(parsed$tickers)) parsed$tickers else NA),
       sent_hype = as.numeric(if (!is.null(parsed$sent_hype)) parsed$sent_hype else NA),
       sent_fomo = as.numeric(if (!is.null(parsed$sent_fomo)) parsed$sent_fomo else NA),
       sent_fear = as.numeric(if (!is.null(parsed$sent_fear)) parsed$sent_fear else NA),
@@ -415,7 +510,8 @@ score_posts_batch <- function(df,
                                max_calls = Inf,
                                api_key,
                                base_url,
-                               workers = 16) {   # <– how many parallel R processes
+                               workers = 8,   # Number of parallel workers
+                               delay_between_batches = 1) {   # Add delay to respect rate limits
 
   message(glue("Scoring {min(nrow(df), max_calls)} posts with ChatGPT..."))
 
@@ -456,7 +552,8 @@ score_posts_batch <- function(df,
           text = df[[text_col]][i],
           api_key = api_key,
           base_url = base_url,
-          prompt_template = llm_prompt_template
+          prompt_template = llm_prompt_template,
+          debug = (i <= 3)  # Debug first 3 posts
         )
       },
       .progress = TRUE
@@ -477,6 +574,39 @@ score_posts_batch <- function(df,
   if (n_failed > 0) {
     message(glue("  Failed scores: {n_failed} (will be imputed with neutral values)"))
   }
+
+  # Debug: Show ticker extraction stats
+  n_with_tickers_raw <- sum(!is.na(scores_df$tickers) & scores_df$tickers != "", na.rm = TRUE)
+  message(glue("  Posts where LLM extracted ticker strings: {n_with_tickers_raw}"))
+
+  # Show sample of extracted tickers for debugging
+  if (n_with_tickers_raw > 0) {
+    sample_tickers <- scores_df %>%
+      filter(!is.na(tickers) & tickers != "") %>%
+      pull(tickers) %>%
+      head(10)
+    message("  Sample of LLM-extracted tickers:")
+    for (ticker in sample_tickers) {
+      message(glue("    - '{ticker}'"))
+    }
+  } else {
+    # Show what the successful posts looked like
+    message("  DEBUG: Checking successful posts for ticker content...")
+
+    # Get indices of successfully scored posts
+    success_idx <- which(!is.na(scores_df$sent_hype))
+
+    if (length(success_idx) > 0) {
+      message("  Sample of successfully scored posts (first 100 chars of text):")
+      for (i in head(success_idx, 3)) {
+        text_preview <- substr(df[[text_col]][i], 1, 100)
+        ticker_value <- if(is.na(scores_df$tickers[i])) "NA" else paste0("'", scores_df$tickers[i], "'")
+        message(glue("    Post {i}: {text_preview}..."))
+        message(glue("      -> Extracted tickers: {ticker_value}"))
+      }
+    }
+  }
+
   message("LLM scoring complete")
 
   return(df_scored)
@@ -541,44 +671,61 @@ aggregate_reddit_to_daily <- function(df_posts_scored) {
 # 5. LOAD PRICE DATA & CREATE GOLD-STANDARD LABEL
 # ------------------------------------------------------------------------------
 
-#' Load and prepare price data with meme alert label
+#' Load and prepare price data with daily top-N most volatile stocks
+#'
+#' This function loads stock price data and filters to keep only the top N
+#' most volatile stocks on EACH trading day based on rolling volatility.
+#' This ensures the tradeable universe changes dynamically over time.
 #'
 #' @param file_path Path to price CSV
-#' @param return_threshold Minimum next-day return for meme event (default: 0.10)
-#' @param volume_multiplier Minimum volume spike multiple (default: 2.0)
-#' @return Tibble with price data and meme_alert label
+#' @param top_n Number of most volatile stocks to keep per day (default: 100)
+#' @param volatility_col Which volatility column to use for ranking
+#' @return Tibble with price data for top-N volatile stocks per day
 load_and_prepare_prices <- function(file_path = "dataset_yahoo_top100_most_volatile_us_stocks.csv",
-                                     return_threshold = 0.10,
-                                     volume_multiplier = 2.0) {
+                                     top_n = 100,
+                                     volatility_col = "rolling_vol_20d") {
 
   message("Loading price data from: ", file_path)
+  message(glue("  Will select top {top_n} most volatile stocks per day"))
 
   df <- read_csv(file_path, show_col_types = FALSE)
 
-  message(glue("  Loaded {nrow(df)} daily observations"))
+  message(glue("  Loaded {nrow(df)} daily observations across {length(unique(df$ticker))} unique tickers"))
 
   # Ensure correct types and rename columns to match pipeline expectations
-  # Dataset has: adj_close, return_log_daily, avg_20d_vol
-  # Pipeline expects: close, ret, vol_ma20
   df <- df %>%
     mutate(
       ticker = str_to_upper(ticker),
       date = as_date(date),
-      # Rename and convert columns to expected format
+      # Rename columns to expected format
       close = as.numeric(adj_close),
       ret = as.numeric(return_log_daily),
       vol_ma20 = as.numeric(avg_20d_vol),
-      volume = as.numeric(volume)
+      volume = as.numeric(volume),
+      # Keep rolling volatility for ranking
+      rolling_volatility = as.numeric(.data[[volatility_col]])
     ) %>%
-    # Keep only columns needed for pipeline
-    select(ticker, date, close, volume, ret, vol_ma20, everything()) %>%
-    # Remove duplicate columns
-    select(-any_of(c("adj_close", "return_log_daily", "avg_20d_vol"))) %>%
+    select(ticker, date, close, volume, ret, vol_ma20, rolling_volatility, everything()) %>%
+    select(-any_of(c("adj_close", "return_log_daily", "avg_20d_vol")))
+
+  # For each date, keep only top N most volatile stocks
+  df_top_volatile <- df %>%
+    group_by(date) %>%
+    filter(!is.na(rolling_volatility)) %>%
+    arrange(date, desc(rolling_volatility)) %>%
+    slice(1:top_n) %>%
+    ungroup() %>%
     arrange(ticker, date)
 
-  message("Price data loaded and columns standardized")
+  n_dates <- length(unique(df_top_volatile$date))
+  n_tickers_unique <- length(unique(df_top_volatile$ticker))
 
-  return(df)
+  message(glue("  Filtered to {nrow(df_top_volatile)} observations"))
+  message(glue("  Across {n_dates} trading days"))
+  message(glue("  With {n_tickers_unique} unique tickers appearing in top-{top_n}"))
+  message("Price data loaded and filtered to daily top-N volatile stocks")
+
+  return(df_top_volatile)
 }
 
 #' Create meme alert label based on next-day price action
@@ -1160,9 +1307,9 @@ predict_meme_alert_for_row <- function(model, new_row,
 
 main <- function() {
 
-  message("\n" %>% paste(rep("=", 5), collapse = ""))
+  message("\n" %>% paste(rep("=", 80) %>% paste(collapse = "")))
   message("LLM-POWERED MEME STOCK PREDICTION PIPELINE")
-  message(rep("=", 5) %>% paste(collapse = ""))
+  message(rep("=", 80) %>% paste(collapse = ""))
   message("")
 
   # --------------------------------------------------------------------------
@@ -1186,38 +1333,54 @@ main <- function() {
   message(rep("-", 80) %>% paste(collapse = ""))
 
   df_price_raw <- load_and_prepare_prices(
-    file_path = "dataset_yahoo_top100_most_volatile_us_stocks.csv"
+    file_path = "dataset_yahoo_top100_most_volatile_us_stocks.csv",
+    top_n = 100,  # Keep top 100 most volatile stocks per day
+    volatility_col = "rolling_vol_20d"  # Use 20-day rolling volatility
   )
 
-  tradeable_tickers <- unique(df_price_raw$ticker)
-  message(glue("  Found {length(tradeable_tickers)} tradeable tickers"))
-
   # --------------------------------------------------------------------------
-  # STEP 3: Extract tickers from Reddit posts
+  # STEP 3: Score ALL posts with ChatGPT (LLM extracts tickers + sentiment)
   # --------------------------------------------------------------------------
 
-  message("\n[STEP 3] Extracting tickers from posts")
-  message(rep("-", 80) %>% paste(collapse = ""))
-
-  df_posts_ticker <- extract_and_unnest_tickers(df_reddit, tradeable_tickers)
-
-  # --------------------------------------------------------------------------
-  # STEP 4: Score posts with ChatGPT (LLM sentiment analysis)
-  # --------------------------------------------------------------------------
-
-  message("\n[STEP 4] Scoring posts with ChatGPT")
+  message("\n[STEP 3] Scoring posts with ChatGPT (LLM extracts tickers + sentiment)")
   message(rep("-", 80) %>% paste(collapse = ""))
   message("Human-Centered Prompting: Using prompt_sentiment_template.txt")
-  message("This template has been refined through iterative design with domain experts")
+  message("LLM will identify tickers (including company names) AND analyze sentiment")
+  message("NOTE: Ticker validation will be done per-date against top-N volatile stocks")
 
-  # For demonstration, limit API calls (remove max_calls in production)
+  # Score all Reddit posts - LLM will extract tickers from text
+  # IMPORTANT: Limit API calls to avoid rate limits and high costs
+  # Start with a small sample to test, then increase max_calls
   df_posts_scored <- score_posts_batch(
-  df = df_posts_ticker,
-  text_col = "text",
-#  batch_size = 100,
-  api_key = api_key,
-  base_url = base_url
-)
+    df = df_reddit,
+    text_col = "text",
+    max_calls = Inf,  # Process all posts
+    api_key = api_key,
+    base_url = base_url,
+    workers = 8  # Parallel execution to speed up processing
+  )
+
+  # --------------------------------------------------------------------------
+  # STEP 4: Filter and unnest LLM-extracted tickers
+  # --------------------------------------------------------------------------
+
+  message("\n[STEP 4] Processing LLM-extracted tickers")
+  message(rep("-", 80) %>% paste(collapse = ""))
+
+  df_posts_ticker <- extract_and_unnest_tickers(df_posts_scored, df_price_raw)
+
+  # Check if we have any valid ticker-post pairs to proceed
+  if (nrow(df_posts_ticker) == 0) {
+    stop("\nERROR: No valid ticker-post pairs found after LLM extraction and validation.\n",
+         "Possible reasons:\n",
+         "  1. LLM did not extract any tickers from Reddit posts\n",
+         "  2. Extracted tickers were not in the top-N volatile stocks on their post dates\n",
+         "  3. Date mismatch between Reddit posts and price data\n",
+         "\nPlease check:\n",
+         "  - API is working correctly (check warnings above)\n",
+         "  - Reddit posts contain stock mentions\n",
+         "  - Price data covers the same date range as Reddit data")
+  }
 
   # --------------------------------------------------------------------------
   # STEP 5: Aggregate to (ticker, date) level
@@ -1226,7 +1389,7 @@ main <- function() {
   message("\n[STEP 5] Aggregating to daily ticker level")
   message(rep("-", 80) %>% paste(collapse = ""))
 
-  df_reddit_daily <- aggregate_reddit_to_daily(df_posts_scored)
+  df_reddit_daily <- aggregate_reddit_to_daily(df_posts_ticker)
 
   # --------------------------------------------------------------------------
   # STEP 6: Create meme alert label
@@ -1237,8 +1400,8 @@ main <- function() {
 
   df_price_labeled <- create_meme_alert_label(
     df_price = df_price_raw,
-    return_threshold = 0.10,
-    volume_multiplier = 2.0
+    return_threshold = 0.03,
+    volume_multiplier = 1.25
   )
 
   # --------------------------------------------------------------------------

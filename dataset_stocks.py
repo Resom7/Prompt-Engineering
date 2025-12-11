@@ -9,9 +9,6 @@ This script:
 5. Selects the 100 most volatile stocks
 6. Creates a comprehensive dataset with returns and rolling volatility
 7. Saves the final dataset as CSV
-
-Author: Claude Code
-Date: 2025-12-11
 """
 
 import pandas as pd
