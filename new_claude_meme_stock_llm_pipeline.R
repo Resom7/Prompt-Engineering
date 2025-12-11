@@ -39,6 +39,11 @@ suppressPackageStartupMessages({
   if (requireNamespace("keras", quietly = TRUE)) {
     library(keras)      # Neural networks (optional)
   }
+  if (requireNamespace("furrr", quietly = TRUE)) {
+  library(furrr)     # Parallel map
+} else {
+  warning("Package 'furrr' not installed – install.packages('furrr') for parallel scoring.")
+}
 })
 
 # Set seed for reproducibility
@@ -240,7 +245,7 @@ call_chatgpt_raw <- function(messages,
                               model = "gpt-4o-mini",
                               api_key,
                               base_url,
-                              max_tokens = 500,
+                              max_tokens = 150,
                               temperature = 0.0) {
 
   # Construct request body
@@ -392,7 +397,7 @@ score_post_with_llm <- function(text,
   })
 
   # Rate limiting
-  Sys.sleep(0.2)
+  Sys.sleep(0.0)
 
   return(scores)
 }
@@ -405,11 +410,13 @@ score_post_with_llm <- function(text,
 #' @param api_key OpenAI API key
 #' @param base_url API endpoint
 #' @return Tibble with original columns plus LLM scores
+
 score_posts_batch <- function(df,
                                text_col = "text",
                                max_calls = Inf,
                                api_key,
-                               base_url) {
+                               base_url,
+                               workers = 8) {   # <– how many parallel R processes
 
   message(glue("Scoring {min(nrow(df), max_calls)} posts with ChatGPT..."))
 
@@ -419,21 +426,45 @@ score_posts_batch <- function(df,
     df <- df %>% slice(1:max_calls)
   }
 
-  # Score each post with progress
   n_total <- nrow(df)
-  scores_list <- vector("list", n_total)
 
-  for (i in seq_len(n_total)) {
-    if (i %% 10 == 0) {
-      message(glue("  Progress: {i}/{n_total} ({round(100*i/n_total)}%)"))
+  if (!requireNamespace("furrr", quietly = TRUE)) {
+    warning("furrr not available – falling back to sequential scoring.")
+    # Your original sequential loop:
+    scores_list <- vector("list", n_total)
+    for (i in seq_len(n_total)) {
+      if (i %% 10 == 0) {
+        message(glue("  Progress: {i}/{n_total} ({round(100*i/n_total)}%)"))
+      }
+      scores_list[[i]] <- score_post_with_llm(
+        text = df[[text_col]][i],
+        api_key = api_key,
+        base_url = base_url,
+        prompt_template = llm_prompt_template
+      )
     }
+  } else {
+    # ---- PARALLEL VERSION ----
+    message(glue("  Using parallel scoring with {workers} workers"))
 
-    scores_list[[i]] <- score_post_with_llm(
-      text = df[[text_col]][i],
-      api_key = api_key,
-      base_url = base_url,
-      prompt_template = llm_prompt_template
+    future::plan(future::multisession, workers = workers)
+
+    # Parallel map over indices; each worker calls your existing scorer
+    scores_list <- furrr::future_map(
+      seq_len(n_total),
+      function(i) {
+        score_post_with_llm(
+          text = df[[text_col]][i],
+          api_key = api_key,
+          base_url = base_url,
+          prompt_template = llm_prompt_template
+        )
+      },
+      .progress = TRUE
     )
+
+    # After scoring, you may want to reset the plan in long sessions:
+    future::plan(future::sequential)
   }
 
   # Bind scores to original data
@@ -1131,12 +1162,12 @@ main <- function() {
 
   # For demonstration, limit API calls (remove max_calls in production)
   df_posts_scored <- score_posts_batch(
-    df = df_posts_ticker,
-    text_col = "text",
-    max_calls = 100,  # Set to Inf for full dataset
-    api_key = api_key,
-    base_url = base_url
-  )
+  df = df_posts_ticker,
+  text_col = "text",
+#  batch_size = 100,
+  api_key = api_key,
+  base_url = base_url
+)
 
   # --------------------------------------------------------------------------
   # STEP 5: Aggregate to (ticker, date) level
