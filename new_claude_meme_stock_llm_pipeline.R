@@ -31,6 +31,7 @@ suppressPackageStartupMessages({
   library(httr)         # HTTP requests for API calls
   library(glue)         # String interpolation
   library(tidymodels)   # ML framework
+  library(keras)        # Neural networks
 
   # Optional packages - load if available
   if (requireNamespace("vip", quietly = TRUE)) {
@@ -104,7 +105,7 @@ Return ONLY the JSON object, no additional text.'
 
 llm_prompt_template <- read_file(llm_prompt_template_file)
 
-message("✓ Setup complete. API key loaded, prompt template ready.")
+message("Setup complete. API key loaded, prompt template ready.")
 
 # ------------------------------------------------------------------------------
 # 1. LOAD & CLEAN REDDIT DATA
@@ -160,7 +161,7 @@ load_and_clean_reddit <- function(file_path = "dataset_meme_reddit_historical_1.
     message(glue("  After subreddit filter: {nrow(df)} posts"))
   }
 
-  message("✓ Reddit data cleaned")
+  message("Reddit data cleaned")
 
   return(df)
 }
@@ -223,7 +224,7 @@ extract_and_unnest_tickers <- function(df_posts, tradeable_tickers) {
     rename(ticker = tickers)  # Rename tickers (plural) to ticker (singular)
 
   message(glue("  Total post-ticker pairs: {nrow(df_posts_ticker)}"))
-  message("✓ Ticker extraction complete")
+  message("Ticker extraction complete")
 
   return(df_posts_ticker)
 }
@@ -476,7 +477,7 @@ score_posts_batch <- function(df,
   if (n_failed > 0) {
     message(glue("  Failed scores: {n_failed} (will be imputed with neutral values)"))
   }
-  message("✓ LLM scoring complete")
+  message("LLM scoring complete")
 
   return(df_scored)
 }
@@ -531,7 +532,7 @@ aggregate_reddit_to_daily <- function(df_posts_scored) {
     mutate(across(where(is.numeric), ~if_else(is.infinite(.x) | is.nan(.x), 0, .x)))
 
   message(glue("  Aggregated to {nrow(df_daily)} (ticker, date) rows"))
-  message("✓ Aggregation complete")
+  message("Aggregation complete")
 
   return(df_daily)
 }
@@ -575,7 +576,7 @@ load_and_prepare_prices <- function(file_path = "dataset_yahoo_top100_most_volat
     select(-any_of(c("adj_close", "return_log_daily", "avg_20d_vol"))) %>%
     arrange(ticker, date)
 
-  message("✓ Price data loaded and columns standardized")
+  message("Price data loaded and columns standardized")
 
   return(df)
 }
@@ -591,8 +592,8 @@ load_and_prepare_prices <- function(file_path = "dataset_yahoo_top100_most_volat
 #' @param volume_multiplier Volume spike multiplier
 #' @return Tibble with meme_alert label
 create_meme_alert_label <- function(df_price,
-                                     return_threshold = 0.10,
-                                     volume_multiplier = 2.0) {
+                                     return_threshold = 0.03,
+                                     volume_multiplier = 1.25) {
 
   message("Creating meme alert label...")
   message(glue("  Return threshold: {return_threshold*100}%"))
@@ -623,7 +624,7 @@ create_meme_alert_label <- function(df_price,
   pct_alerts <- round(100 * n_alerts / nrow(df_labeled), 2)
 
   message(glue("  Meme alerts: {n_alerts} ({pct_alerts}% of days)"))
-  message("✓ Label creation complete")
+  message("Label creation complete")
 
   return(df_labeled)
 }
@@ -682,7 +683,7 @@ merge_reddit_and_prices <- function(df_reddit_daily, df_price_labeled) {
     select(-n_na_llm)
 
   message(glue("  After imputing missing values: {nrow(df_model)} rows"))
-  message("✓ Merge complete")
+  message("Merge complete")
 
   return(df_model)
 }
@@ -729,7 +730,7 @@ make_time_splits <- function(df_model, train_pct = 0.70, val_pct = 0.15) {
   message(glue("    Val:   {sum(val_df$meme_alert==1)}/{nrow(val_df)} ({round(100*mean(val_df$meme_alert==1),1)}%)"))
   message(glue("    Test:  {sum(test_df$meme_alert==1)}/{nrow(test_df)} ({round(100*mean(test_df$meme_alert==1),1)}%)"))
 
-  message("✓ Data splits created")
+  message("Data splits created")
 
   return(list(
     train_df = train_df,
@@ -797,7 +798,7 @@ train_logistic_model <- function(train_df, val_df) {
   message("  Validation metrics:")
   print(val_metrics)
 
-  message("✓ Logistic regression training complete")
+  message("Logistic regression training complete")
 
   return(list(
     workflow = logit_fit,
@@ -864,7 +865,7 @@ evaluate_model <- function(model_fit, test_df, model_name = "Model") {
 
   print(roc_plot)
 
-  message(glue("✓ {model_name} evaluation complete"))
+  message(glue("{model_name} evaluation complete"))
 
   return(list(
     metrics = test_metrics_detailed,
@@ -933,7 +934,7 @@ prepare_nn_data <- function(train_df, val_df, test_df) {
   y_test <- test_df$meme_alert
 
   message(glue("  Feature matrix shape: ({nrow(X_train_mat)}, {ncol(X_train_mat)})"))
-  message("✓ Data preparation complete")
+  message("Data preparation complete")
 
   return(list(
     X_train = X_train_mat,
@@ -956,6 +957,19 @@ prepare_nn_data <- function(train_df, val_df, test_df) {
 train_nn_model <- function(nn_data, epochs = 50, batch_size = 32) {
 
   message("Training neural network classifier...")
+
+  # Calculate class weights to handle imbalance
+  n_neg <- sum(nn_data$y_train == 0)
+  n_pos <- sum(nn_data$y_train == 1)
+  total <- n_neg + n_pos
+
+  weight_for_0 <- (1 / n_neg) * (total / 2.0)
+  weight_for_1 <- (1 / n_pos) * (total / 2.0)
+
+  class_weight <- list("0" = weight_for_0, "1" = weight_for_1)
+
+  message(glue("  Class distribution - Negative: {n_neg}, Positive: {n_pos}"))
+  message(glue("  Class weights - 0: {round(weight_for_0, 4)}, 1: {round(weight_for_1, 4)}"))
 
   # Define model architecture
   model <- keras_model_sequential() %>%
@@ -982,19 +996,20 @@ train_nn_model <- function(nn_data, epochs = 50, batch_size = 32) {
     restore_best_weights = TRUE
   )
 
-  # Train model
-  message("  Training...")
+  # Train model with class weights
+  message("  Training with class weights to handle imbalance...")
   history <- model %>% fit(
     x = nn_data$X_train,
     y = nn_data$y_train,
     epochs = epochs,
     batch_size = batch_size,
     validation_data = list(nn_data$X_val, nn_data$y_val),
+    class_weight = class_weight,
     callbacks = list(early_stop),
     verbose = 1
   )
 
-  message("✓ Neural network training complete")
+  message("Neural network training complete")
 
   return(list(
     model = model,
@@ -1013,6 +1028,12 @@ evaluate_nn_model <- function(model, nn_data) {
 
   # Predictions
   y_pred_prob <- model %>% predict(nn_data$X_test) %>% as.vector()
+
+  # Show prediction probability distribution
+  message(glue("  Prediction probability range: [{round(min(y_pred_prob), 4)}, {round(max(y_pred_prob), 4)}]"))
+  message(glue("  Mean prediction probability: {round(mean(y_pred_prob), 4)}"))
+  message(glue("  Predictions > 0.5: {sum(y_pred_prob > 0.5)} / {length(y_pred_prob)}"))
+
   y_pred_class <- if_else(y_pred_prob > 0.5, 1L, 0L)
 
   # Create predictions tibble
@@ -1041,7 +1062,7 @@ evaluate_nn_model <- function(model, nn_data) {
   message("  Confusion matrix:")
   print(conf_mat)
 
-  message("✓ Neural network evaluation complete")
+  message("Neural network evaluation complete")
 
   return(list(
     metrics = test_metrics,
@@ -1069,18 +1090,25 @@ save_outputs <- function(df_model,
   message("Saving outputs...")
 
   # Save dataset
-  write_csv(df_model, file.path(output_dir, "dataset_meme_with_llm.csv"))
-  message("  Saved: dataset_meme_with_llm.csv")
+  write_csv(df_model, file.path(output_dir, "dataset_llm_meme.csv"))
+  message("  Saved: dataset_llm_meme.csv")
+
+  # Create models directory if it doesn't exist
+  models_dir <- file.path(output_dir, "models")
+  if (!dir.exists(models_dir)) {
+    dir.create(models_dir, recursive = TRUE)
+    message("  Created directory: models/")
+  }
 
   # Save logistic regression workflow
-  saveRDS(logit_results$workflow, file.path(output_dir, "logistic_meme_model.rds"))
-  message("  Saved: logistic_meme_model.rds")
+  saveRDS(logit_results$workflow, file.path(models_dir, "logistic_meme_model.rds"))
+  message("  Saved: models/logistic_meme_model.rds")
 
   # Save neural network model (if available)
   if (!is.null(nn_model) && !is.null(nn_model$model)) {
     tryCatch({
-      save_model_hdf5(nn_model$model, file.path(output_dir, "nn_meme_model.h5"))
-      message("  Saved: nn_meme_model.h5")
+      save_model_hdf5(nn_model$model, file.path(models_dir, "nn_meme_model.h5"))
+      message("  Saved: models/nn_meme_model.h5")
     }, error = function(e) {
       message("  Skipped saving NN model (keras not available)")
     })
@@ -1088,11 +1116,11 @@ save_outputs <- function(df_model,
 
   # Save normalization parameters for NN (if available)
   if (!is.null(nn_data) && !is.null(nn_data$normalization)) {
-    saveRDS(nn_data$normalization, file.path(output_dir, "nn_normalization.rds"))
-    message("  Saved: nn_normalization.rds")
+    saveRDS(nn_data$normalization, file.path(models_dir, "nn_normalization.rds"))
+    message("  Saved: models/nn_normalization.rds")
   }
 
-  message("✓ All outputs saved")
+  message("All outputs saved")
 }
 
 #' Predict meme alert for a new observation
@@ -1132,9 +1160,9 @@ predict_meme_alert_for_row <- function(model, new_row,
 
 main <- function() {
 
-  message("\n" %>% paste(rep("=", 80), collapse = ""))
+  message("\n" %>% paste(rep("=", 5), collapse = ""))
   message("LLM-POWERED MEME STOCK PREDICTION PIPELINE")
-  message(rep("=", 80) %>% paste(collapse = ""))
+  message(rep("=", 5) %>% paste(collapse = ""))
   message("")
 
   # --------------------------------------------------------------------------
@@ -1279,11 +1307,11 @@ main <- function() {
 
     if (!is.null(nn_results)) {
       nn_data <- nn_results$data
-      nn_results <- nn_results$model
+      nn_model_fitted <- nn_results$model
       nn_test_results <- nn_results$test
     } else {
       nn_data <- NULL
-      nn_results <- NULL
+      nn_model_fitted <- NULL
       nn_test_results <- NULL
     }
   } else {
@@ -1291,7 +1319,7 @@ main <- function() {
     message("  To enable neural networks, install keras:")
     message("    install.packages('keras')")
     nn_data <- NULL
-    nn_results <- NULL
+    nn_model_fitted <- NULL
     nn_test_results <- NULL
   }
 
@@ -1305,7 +1333,7 @@ main <- function() {
   save_outputs(
     df_model = df_model,
     logit_results = logit_results,
-    nn_model = nn_results,
+    nn_model = nn_model_fitted,
     nn_data = nn_data,
     output_dir = "."
   )
@@ -1351,7 +1379,7 @@ main <- function() {
     splits = splits,
     logit = logit_results,
     logit_test = logit_test_results,
-    nn = nn_results,
+    nn = nn_model_fitted,
     nn_test = nn_test_results
   ))
 }
