@@ -42,7 +42,7 @@ suppressPackageStartupMessages({
   if (requireNamespace("furrr", quietly = TRUE)) {
   library(furrr)     # Parallel map
 } else {
-  warning("Package 'furrr' not installed – install.packages('furrr') for parallel scoring.")
+  warning("Package 'furrr' not installed - install.packages('furrr') for parallel scoring.")
 }
 })
 
@@ -368,12 +368,13 @@ score_post_with_llm <- function(text,
   # Parse JSON response
   scores <- tryCatch({
     # Extract JSON from response (in case there's extra text)
-    json_match <- str_extract(response_text, "\\{[^}]+\\}")
+    # Use more flexible regex to handle nested braces
+    json_match <- str_extract(response_text, "\\{[^{}]*(?:\\{[^{}]*\\}[^{}]*)*\\}")
     if (is.na(json_match)) {
       # Try to parse entire response
-      parsed <- fromJSON(response_text)
+      parsed <- fromJSON(response_text, simplifyVector = FALSE)
     } else {
-      parsed <- fromJSON(json_match)
+      parsed <- fromJSON(json_match, simplifyVector = FALSE)
     }
 
     # Convert to tibble with expected columns
@@ -396,9 +397,6 @@ score_post_with_llm <- function(text,
     default_scores
   })
 
-  # Rate limiting
-  Sys.sleep(0.0)
-
   return(scores)
 }
 
@@ -416,7 +414,7 @@ score_posts_batch <- function(df,
                                max_calls = Inf,
                                api_key,
                                base_url,
-                               workers = 8) {   # <– how many parallel R processes
+                               workers = 16) {   # <– how many parallel R processes
 
   message(glue("Scoring {min(nrow(df), max_calls)} posts with ChatGPT..."))
 
@@ -471,6 +469,13 @@ score_posts_batch <- function(df,
   scores_df <- bind_rows(scores_list)
   df_scored <- bind_cols(df, scores_df)
 
+  # Report scoring success rate
+  n_failed <- sum(is.na(scores_df$sent_hype))
+  success_rate <- round(100 * (n_total - n_failed) / n_total, 1)
+  message(glue("  Successfully scored: {n_total - n_failed}/{n_total} ({success_rate}%)"))
+  if (n_failed > 0) {
+    message(glue("  Failed scores: {n_failed} (will be imputed with neutral values)"))
+  }
   message("✓ LLM scoring complete")
 
   return(df_scored)
@@ -494,27 +499,27 @@ aggregate_reddit_to_daily <- function(df_posts_scored) {
       # Post volume
       num_posts = n(),
 
-      # Sentiment: mean and max
-      mean_sent_hype = mean(sent_hype, na.rm = TRUE),
-      max_sent_hype = max(sent_hype, na.rm = TRUE),
-      mean_sent_fomo = mean(sent_fomo, na.rm = TRUE),
-      max_sent_fomo = max(sent_fomo, na.rm = TRUE),
-      mean_sent_fear = mean(sent_fear, na.rm = TRUE),
-      mean_sent_panic = mean(sent_panic, na.rm = TRUE),
-      mean_sent_sarcasm = mean(sent_sarcasm, na.rm = TRUE),
-      mean_sent_confidence = mean(sent_confidence, na.rm = TRUE),
-      mean_sent_anger = mean(sent_anger, na.rm = TRUE),
-      mean_sent_regret = mean(sent_regret, na.rm = TRUE),
+      # Sentiment: mean and max (replace NaN with 0 for days with no valid scores)
+      mean_sent_hype = if_else(is.nan(mean(sent_hype, na.rm = TRUE)), 0, mean(sent_hype, na.rm = TRUE)),
+      max_sent_hype = if_else(is.infinite(max(sent_hype, na.rm = TRUE)), 0, max(sent_hype, na.rm = TRUE)),
+      mean_sent_fomo = if_else(is.nan(mean(sent_fomo, na.rm = TRUE)), 0, mean(sent_fomo, na.rm = TRUE)),
+      max_sent_fomo = if_else(is.infinite(max(sent_fomo, na.rm = TRUE)), 0, max(sent_fomo, na.rm = TRUE)),
+      mean_sent_fear = if_else(is.nan(mean(sent_fear, na.rm = TRUE)), 0, mean(sent_fear, na.rm = TRUE)),
+      mean_sent_panic = if_else(is.nan(mean(sent_panic, na.rm = TRUE)), 0, mean(sent_panic, na.rm = TRUE)),
+      mean_sent_sarcasm = if_else(is.nan(mean(sent_sarcasm, na.rm = TRUE)), 0, mean(sent_sarcasm, na.rm = TRUE)),
+      mean_sent_confidence = if_else(is.nan(mean(sent_confidence, na.rm = TRUE)), 0, mean(sent_confidence, na.rm = TRUE)),
+      mean_sent_anger = if_else(is.nan(mean(sent_anger, na.rm = TRUE)), 0, mean(sent_anger, na.rm = TRUE)),
+      mean_sent_regret = if_else(is.nan(mean(sent_regret, na.rm = TRUE)), 0, mean(sent_regret, na.rm = TRUE)),
 
-      # Share of posts with strong signals
-      share_hype_posts = mean(sent_hype > 0.5, na.rm = TRUE),
-      share_fomo_posts = mean(sent_fomo > 0.5, na.rm = TRUE),
+      # Share of posts with strong signals (replace NaN with 0)
+      share_hype_posts = if_else(is.nan(mean(sent_hype > 0.5, na.rm = TRUE)), 0, mean(sent_hype > 0.5, na.rm = TRUE)),
+      share_fomo_posts = if_else(is.nan(mean(sent_fomo > 0.5, na.rm = TRUE)), 0, mean(sent_fomo > 0.5, na.rm = TRUE)),
 
-      # Emoji indicators
-      share_rocket_emoji = mean(has_rocket_emoji == 1, na.rm = TRUE),
-      share_moon_emoji = mean(has_moon_emoji == 1, na.rm = TRUE),
-      share_diamond_emoji = mean(has_diamond_emoji == 1, na.rm = TRUE),
-      share_money_emoji = mean(has_money_emoji == 1, na.rm = TRUE),
+      # Emoji indicators (replace NaN with 0)
+      share_rocket_emoji = if_else(is.nan(mean(has_rocket_emoji == 1, na.rm = TRUE)), 0, mean(has_rocket_emoji == 1, na.rm = TRUE)),
+      share_moon_emoji = if_else(is.nan(mean(has_moon_emoji == 1, na.rm = TRUE)), 0, mean(has_moon_emoji == 1, na.rm = TRUE)),
+      share_diamond_emoji = if_else(is.nan(mean(has_diamond_emoji == 1, na.rm = TRUE)), 0, mean(has_diamond_emoji == 1, na.rm = TRUE)),
+      share_money_emoji = if_else(is.nan(mean(has_money_emoji == 1, na.rm = TRUE)), 0, mean(has_money_emoji == 1, na.rm = TRUE)),
 
       # Engagement metrics
       avg_score = mean(score, na.rm = TRUE),
@@ -522,8 +527,8 @@ aggregate_reddit_to_daily <- function(df_posts_scored) {
 
       .groups = "drop"
     ) %>%
-    # Replace Inf/-Inf with NA
-    mutate(across(where(is.numeric), ~if_else(is.infinite(.x), NA_real_, .x)))
+    # Replace any remaining Inf/-Inf/NaN with 0 (neutral)
+    mutate(across(where(is.numeric), ~if_else(is.infinite(.x) | is.nan(.x), 0, .x)))
 
   message(glue("  Aggregated to {nrow(df_daily)} (ticker, date) rows"))
   message("✓ Aggregation complete")
@@ -659,16 +664,24 @@ merge_reddit_and_prices <- function(df_reddit_daily, df_price_labeled) {
     print(na_counts)
   }
 
-  # Remove rows with too many NAs in LLM features
+  # Check for rows with missing LLM features and impute instead of removing
   llm_cols <- names(df_model)[str_detect(names(df_model), "^(sent_|has_|share_|mean_|max_)")]
+
+  # Count NA rows for reporting
   df_model <- df_model %>%
     rowwise() %>%
     mutate(n_na_llm = sum(is.na(c_across(all_of(llm_cols))))) %>%
-    ungroup() %>%
-    filter(n_na_llm < length(llm_cols) * 0.5) %>%  # Keep if < 50% NAs
+    ungroup()
+
+  n_with_nas <- sum(df_model$n_na_llm > 0)
+  message(glue("  Rows with missing LLM features: {n_with_nas}"))
+
+  # Impute missing LLM features with 0 (neutral sentiment) instead of removing rows
+  df_model <- df_model %>%
+    mutate(across(all_of(llm_cols), ~if_else(is.na(.x), 0, .x))) %>%
     select(-n_na_llm)
 
-  message(glue("  After removing high-NA rows: {nrow(df_model)} rows"))
+  message(glue("  After imputing missing values: {nrow(df_model)} rows"))
   message("✓ Merge complete")
 
   return(df_model)
@@ -738,10 +751,12 @@ train_logistic_model <- function(train_df, val_df) {
 
   message("Training logistic regression model...")
 
+  # Convert meme_alert to factor BEFORE creating recipe
+  train_df <- train_df %>%
+    mutate(meme_alert = factor(as.character(meme_alert), levels = c("0", "1")))
+
   # Define recipe
   logit_recipe <- recipe(meme_alert ~ ., data = train_df) %>%
-    # Convert outcome to factor
-    step_mutate(meme_alert = factor(meme_alert, levels = c("0", "1"))) %>%
     # Remove ID columns
     step_rm(ticker, date, ret_lead1, vol_lead1) %>%
     # Handle missing values
@@ -767,12 +782,13 @@ train_logistic_model <- function(train_df, val_df) {
 
   # Evaluate on validation set
   message("  Evaluating on validation set...")
-  val_df_factor <- val_df %>%
-    mutate(meme_alert = factor(meme_alert, levels = c("0", "1")))
+  # Convert validation target to factor to match training data
+  val_df <- val_df %>%
+    mutate(meme_alert = factor(as.character(meme_alert), levels = c("0", "1")))
 
-  val_pred <- predict(logit_fit, val_df_factor, type = "prob") %>%
-    bind_cols(predict(logit_fit, val_df_factor, type = "class")) %>%
-    bind_cols(val_df_factor %>% select(meme_alert))
+  val_pred <- predict(logit_fit, val_df, type = "prob") %>%
+    bind_cols(predict(logit_fit, val_df, type = "class")) %>%
+    bind_cols(val_df %>% select(meme_alert))
 
   # Calculate metrics
   val_metrics <- val_pred %>%
@@ -800,14 +816,14 @@ evaluate_model <- function(model_fit, test_df, model_name = "Model") {
 
   message(glue("Evaluating {model_name} on test set..."))
 
-  # Prepare test data
-  test_df_factor <- test_df %>%
-    mutate(meme_alert = factor(meme_alert, levels = c("0", "1")))
+  # Prepare test data - convert target to factor to match training
+  test_df <- test_df %>%
+    mutate(meme_alert = factor(as.character(meme_alert), levels = c("0", "1")))
 
   # Predictions
-  test_pred <- predict(model_fit, test_df_factor, type = "prob") %>%
-    bind_cols(predict(model_fit, test_df_factor, type = "class")) %>%
-    bind_cols(test_df_factor %>% select(meme_alert))
+  test_pred <- predict(model_fit, test_df, type = "prob") %>%
+    bind_cols(predict(model_fit, test_df, type = "class")) %>%
+    bind_cols(test_df %>% select(meme_alert))
 
   # Metrics
   test_metrics <- test_pred %>%
@@ -1053,22 +1069,28 @@ save_outputs <- function(df_model,
   message("Saving outputs...")
 
   # Save dataset
-  write_csv(df_model, file.path(output_dir, "meme_asset_day_dataset_with_llm.csv"))
-  message("  Saved: meme_asset_day_dataset_with_llm.csv")
+  write_csv(df_model, file.path(output_dir, "dataset_meme_with_llm.csv"))
+  message("  Saved: dataset_meme_with_llm.csv")
 
   # Save logistic regression workflow
   saveRDS(logit_results$workflow, file.path(output_dir, "logistic_meme_model.rds"))
   message("  Saved: logistic_meme_model.rds")
 
-  # Save neural network model
-  if (!is.null(nn_model$model)) {
-    save_model_hdf5(nn_model$model, file.path(output_dir, "nn_meme_model.h5"))
-    message("  Saved: nn_meme_model.h5")
+  # Save neural network model (if available)
+  if (!is.null(nn_model) && !is.null(nn_model$model)) {
+    tryCatch({
+      save_model_hdf5(nn_model$model, file.path(output_dir, "nn_meme_model.h5"))
+      message("  Saved: nn_meme_model.h5")
+    }, error = function(e) {
+      message("  Skipped saving NN model (keras not available)")
+    })
   }
 
-  # Save normalization parameters for NN
-  saveRDS(nn_data$normalization, file.path(output_dir, "nn_normalization.rds"))
-  message("  Saved: nn_normalization.rds")
+  # Save normalization parameters for NN (if available)
+  if (!is.null(nn_data) && !is.null(nn_data$normalization)) {
+    saveRDS(nn_data$normalization, file.path(output_dir, "nn_normalization.rds"))
+    message("  Saved: nn_normalization.rds")
+  }
 
   message("✓ All outputs saved")
 }
@@ -1229,17 +1251,49 @@ main <- function() {
   )
 
   # --------------------------------------------------------------------------
-  # STEP 10: Train neural network model
+  # STEP 10: Train neural network model (optional)
   # --------------------------------------------------------------------------
 
   message("\n[STEP 10] Training neural network classifier")
   message(rep("-", 80) %>% paste(collapse = ""))
 
-  nn_data <- prepare_nn_data(train_df, val_df, test_df)
-  nn_results <- train_nn_model(nn_data, epochs = 50, batch_size = 32)
+  # Check if keras/tensorflow is available
+  nn_available <- requireNamespace("keras", quietly = TRUE)
 
-  # Evaluate NN
-  nn_test_results <- evaluate_nn_model(nn_results$model, nn_data)
+  if (nn_available) {
+    # Try to use keras - if TensorFlow not installed, skip gracefully
+    nn_results <- tryCatch({
+      nn_data <- prepare_nn_data(train_df, val_df, test_df)
+      nn_model <- train_nn_model(nn_data, epochs = 50, batch_size = 32)
+      nn_test <- evaluate_nn_model(nn_model$model, nn_data)
+      list(data = nn_data, model = nn_model, test = nn_test)
+    }, error = function(e) {
+      message("  Neural network training skipped:")
+      message("  ", e$message)
+      message("  To enable neural networks, install TensorFlow:")
+      message("    install.packages('keras')")
+      message("    library(keras)")
+      message("    install_keras()")
+      NULL
+    })
+
+    if (!is.null(nn_results)) {
+      nn_data <- nn_results$data
+      nn_results <- nn_results$model
+      nn_test_results <- nn_results$test
+    } else {
+      nn_data <- NULL
+      nn_results <- NULL
+      nn_test_results <- NULL
+    }
+  } else {
+    message("  Keras package not available. Skipping neural network training.")
+    message("  To enable neural networks, install keras:")
+    message("    install.packages('keras')")
+    nn_data <- NULL
+    nn_results <- NULL
+    nn_test_results <- NULL
+  }
 
   # --------------------------------------------------------------------------
   # STEP 11: Save outputs
@@ -1260,9 +1314,9 @@ main <- function() {
   # FINAL SUMMARY
   # --------------------------------------------------------------------------
 
-  message("\n" %>% paste(rep("=", 80), collapse = ""))
+  message("\n" %>% paste(rep("=", 5), collapse = ""))
   message("PIPELINE COMPLETE - SUMMARY")
-  message(rep("=", 80) %>% paste(collapse = ""))
+  message(rep("=", 5) %>% paste(collapse = ""))
 
   message("\nHuman-Centered Prompting Results:")
   message("  Prompt template: prompt_sentiment_template.txt")
@@ -1275,17 +1329,21 @@ main <- function() {
     pull(.estimate)
   message(glue("    Accuracy: {round(logit_acc, 4)}"))
 
-  message("  Neural Network:")
-  nn_acc <- nn_test_results$metrics %>%
-    filter(.metric == "accuracy") %>%
-    pull(.estimate)
-  message(glue("    Accuracy: {round(nn_acc, 4)}"))
+  if (!is.null(nn_test_results)) {
+    message("  Neural Network:")
+    nn_acc <- nn_test_results$metrics %>%
+      filter(.metric == "accuracy") %>%
+      pull(.estimate)
+    message(glue("    Accuracy: {round(nn_acc, 4)}"))
+  } else {
+    message("  Neural Network: Skipped (TensorFlow not available)")
+  }
 
   message("\nIteration & Refinement:")
   message("  To improve performance, modify prompt_sentiment_template.txt and rerun")
   message("  Compare metrics across iterations to evaluate prompt effectiveness")
 
-  message("\n" %>% paste(rep("=", 80), collapse = ""))
+  message("\n" %>% paste(rep("=", 5), collapse = ""))
 
   # Return results
   invisible(list(
