@@ -1,249 +1,159 @@
 ############################################################
-# Meme Stocks: Modelling Using Pre-Scored LLM Sentiment
-# ---------------------------------------------------------
-#  1) Load Reddit + price data (LLM sentiment already added)
-#  2) Extract tickers from Reddit text
-#  3) Aggregate to (ticker, date) level
-#  4) Create meme_alert label from prices
-#  5) Merge Reddit + price features
-#  6) Train:
-#       - Logistic regression (tidymodels)
-#       - Neural net (torch MLP)
-#  7) Evaluate on time-based train/val/test split
-#  8) Save dataset + models
+# Meme stock detection using Reddit (LLM sentiment/features)
 ############################################################
-
-## 0. SETUP ------------------------------------------------
 
 library(tidyverse)
 library(lubridate)
 library(purrr)
-library(jsonlite)
-library(rsample)
 library(tidymodels)
 library(slider)
 library(torch)
 
 set.seed(123)
 
-# ---- File paths (EDIT THESE IF NEEDED) ----
 reddit_path <- "~/Documents/PEE/LLM_dataset.csv"
 price_path  <- "~/Documents/PEE/price_yahoo_dataset.csv"
 
-############################################################
-# 1. LOAD & PREPARE PRICE DATA
-############################################################
+# ----------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------
+
+ensure_col <- function(df, target, alternatives = character()) {
+  if (target %in% names(df)) return(df)
+  for (alt in alternatives) {
+    if (alt %in% names(df)) return(dplyr::rename(df, !!target := !!rlang::sym(alt)))
+  }
+  stop("Missing column '", target, "'. Looked for: ", paste(c(target, alternatives), collapse = ", "))
+}
+
+zscore <- function(x) {
+  s <- sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(NA_real_, length(x)))
+  (x - mean(x, na.rm = TRUE)) / s
+}
+
+# ----------------------------------------------------------
+# 1) Prices: standard columns + returns + 20d avg volume
+# ----------------------------------------------------------
 
 load_and_prepare_prices <- function(price_path) {
   price_raw <- readr::read_csv(price_path, show_col_types = FALSE)
   names(price_raw) <- tolower(names(price_raw))
   
-  # ticker
-  if (!"ticker" %in% names(price_raw)) {
-    if ("symbol" %in% names(price_raw)) {
-      price_raw <- dplyr::rename(price_raw, ticker = symbol)
-    } else {
-      stop("Could not find a 'ticker' or 'symbol' column. Columns: ",
-           paste(names(price_raw), collapse = ", "))
-    }
-  }
+  price_raw <- price_raw %>%
+    ensure_col("ticker", c("symbol")) %>%
+    ensure_col("date",   c("timestamp")) %>%
+    ensure_col("close",  c("adjclose", "adj_close"))
   
-  # date
-  if (!"date" %in% names(price_raw)) {
-    if ("timestamp" %in% names(price_raw)) {
-      price_raw <- dplyr::rename(price_raw, date = timestamp)
-    } else {
-      stop("Could not find a 'date' or 'timestamp' column. Columns: ",
-           paste(names(price_raw), collapse = ", "))
-    }
-  }
+  if (!"volume" %in% names(price_raw)) stop("Missing column 'volume'.")
   
-  # close
-  if (!"close" %in% names(price_raw)) {
-    if ("adjclose" %in% names(price_raw)) {
-      price_raw <- dplyr::rename(price_raw, close = adjclose)
-    } else if ("adj_close" %in% names(price_raw)) {
-      price_raw <- dplyr::rename(price_raw, close = adj_close)
-    } else {
-      stop("Could not find 'close' (or adjclose/adj_close) column. Columns: ",
-           paste(names(price_raw), collapse = ", "))
-    }
-  }
-  
-  # volume
-  if (!"volume" %in% names(price_raw)) {
-    stop("Could not find 'volume' column. Columns: ",
-         paste(names(price_raw), collapse = ", "))
-  }
-  
-  price_df <- price_raw %>%
+  price_raw %>%
     mutate(
       ticker = toupper(as.character(ticker)),
       date   = as.Date(date)
     ) %>%
-    arrange(ticker, date)
-  
-  # ret
-  if (!"ret" %in% names(price_df)) {
-    price_df <- price_df %>%
-      group_by(ticker) %>%
-      mutate(ret = close / dplyr::lag(close) - 1) %>%
-      ungroup()
-  }
-  
-  # vol_ma20
-  if (!"vol_ma20" %in% names(price_df)) {
-    price_df <- price_df %>%
-      group_by(ticker) %>%
-      mutate(
-        vol_ma20 = slider::slide_dbl(
-          volume,
-          mean,
-          .before   = 19,
-          .complete = TRUE
-        )
-      ) %>%
-      ungroup()
-  }
-  
-  needed <- c("ticker", "date", "close", "volume", "ret", "vol_ma20")
-  missing_cols <- setdiff(needed, names(price_df))
-  if (length(missing_cols) > 0) {
-    stop("Missing columns in price dataset even after processing: ",
-         paste(missing_cols, collapse = ", "))
-  }
-  
-  price_df
+    arrange(ticker, date) %>%
+    group_by(ticker) %>%
+    mutate(
+      ret      = if ("ret" %in% names(.)) ret else close / lag(close) - 1,
+      vol_ma20 = if ("vol_ma20" %in% names(.)) vol_ma20 else
+        slider::slide_dbl(volume, mean, .before = 19, .complete = TRUE)
+    ) %>%
+    ungroup() %>%
+    select(ticker, date, close, volume, ret, vol_ma20)
 }
 
 price_df <- load_and_prepare_prices(price_path)
 tradeable_tickers <- unique(price_df$ticker)
-message("Loaded price data for ", length(tradeable_tickers), " tickers.")
 
-############################################################
-# 2. LOAD & CLEAN REDDIT DATA (WITH LLM SENTIMENT)
-############################################################
+# ----------------------------------------------------------
+# 2) Reddit: clean text + date
+# ----------------------------------------------------------
 
 load_and_clean_reddit <- function(reddit_path) {
   df <- readr::read_csv(reddit_path, show_col_types = FALSE)
   
   if (!"created_dt" %in% names(df) && "created_utc" %in% names(df)) {
-    df <- df %>%
-      mutate(created_dt = as_datetime(created_utc, tz = "UTC"))
+    df <- df %>% mutate(created_dt = as_datetime(created_utc, tz = "UTC"))
   }
   
-  df <- df %>%
+  df %>%
     mutate(
       created_dt = ymd_hms(created_dt, tz = "UTC"),
       date       = as.Date(created_dt),
       title      = coalesce(title, ""),
       selftext   = coalesce(selftext, ""),
-      text_raw   = paste(title, selftext, sep = "\n\n"),
-      text       = stringr::str_squish(text_raw)
+      text       = str_squish(paste(title, selftext, sep = "\n\n"))
     ) %>%
     filter(!is.na(text), nchar(text) >= 10)
-  
-  df
 }
 
 reddit_df <- load_and_clean_reddit(reddit_path)
-message("Loaded Reddit posts: ", nrow(reddit_df))
 
-############################################################
-# 3. EXTRACT TICKERS FROM TEXT
-############################################################
+# ----------------------------------------------------------
+# 3) Ticker extraction from Reddit posts
+# ----------------------------------------------------------
 
 extract_tickers <- function(text, tradeable_tickers) {
   if (is.na(text) || !nzchar(text)) return(character(0))
-  
   txt <- toupper(text)
   
-  dollar_syms <- stringr::str_extract_all(txt, "\\$[A-Z]{1,5}") %>%
-    unlist() %>%
-    stringr::str_sub(2)
+  dollar_syms <- str_extract_all(txt, "\\$[A-Z]{1,5}") %>% unlist() %>% str_sub(2)
+  bare_syms   <- str_extract_all(txt, "\\b[A-Z]{2,5}\\b") %>% unlist()
   
-  bare_syms <- stringr::str_extract_all(txt, "\\b[A-Z]{2,5}\\b") %>%
-    unlist()
-  
-  candidates <- unique(c(dollar_syms, bare_syms))
-  intersect(candidates, tradeable_tickers)
+  intersect(unique(c(dollar_syms, bare_syms)), tradeable_tickers)
 }
-
-reddit_df <- reddit_df %>%
-  mutate(
-    tickers = map(text, extract_tickers, tradeable_tickers = tradeable_tickers)
-  )
 
 reddit_posts_ticker <- reddit_df %>%
+  mutate(tickers = map(text, extract_tickers, tradeable_tickers = tradeable_tickers)) %>%
   filter(map_int(tickers, length) > 0) %>%
-  unnest(tickers, names_repair = "check_unique") %>%
-  rename(ticker = tickers) %>%
-  mutate(ticker = toupper(ticker))
+  unnest(tickers) %>%
+  transmute(
+    ticker = toupper(tickers),
+    date,
+    across(everything(), identity)
+  )
 
-message("Number of post–ticker pairs: ", nrow(reddit_posts_ticker))
+# ----------------------------------------------------------
+# 4) Aggregate LLM features to daily (ticker, date)
+# ----------------------------------------------------------
 
-############################################################
-# 4. AGGREGATE LLM FEATURES TO (TICKER, DATE)
-############################################################
+reddit_daily <- reddit_posts_ticker %>%
+  group_by(ticker, date) %>%
+  summarise(
+    num_posts            = n(),
+    mean_sent_hype       = mean(sent_hype, na.rm = TRUE),
+    max_sent_hype        = ifelse(all(is.na(sent_hype)), NA_real_, max(sent_hype, na.rm = TRUE)),
+    mean_sent_fomo       = mean(sent_fomo, na.rm = TRUE),
+    mean_sent_fear       = mean(sent_fear, na.rm = TRUE),
+    mean_sent_panic      = mean(sent_panic, na.rm = TRUE),
+    mean_sent_sarcasm    = mean(sent_sarcasm, na.rm = TRUE),
+    mean_sent_confidence = mean(sent_confidence, na.rm = TRUE),
+    mean_sent_anger      = mean(sent_anger, na.rm = TRUE),
+    mean_sent_regret     = mean(sent_regret, na.rm = TRUE),
+    share_rocket_emoji   = mean(has_rocket_emoji == 1, na.rm = TRUE),
+    share_moon_emoji     = mean(has_moon_emoji == 1, na.rm = TRUE),
+    share_diamond_emoji  = mean(has_diamond_emoji == 1, na.rm = TRUE),
+    share_money_emoji    = mean(has_money_emoji == 1, na.rm = TRUE),
+    avg_score            = mean(score, na.rm = TRUE),
+    avg_num_comments     = mean(num_comments, na.rm = TRUE),
+    .groups = "drop"
+  )
 
-aggregate_reddit_to_daily <- function(df_posts) {
-  df_posts %>%
-    mutate(date = as.Date(date)) %>%
-    group_by(ticker, date) %>%
-    summarise(
-      num_posts            = n(),
-      mean_sent_hype       = mean(sent_hype, na.rm = TRUE),
-      max_sent_hype        = ifelse(
-        all(is.na(sent_hype)), NA_real_,
-        max(sent_hype, na.rm = TRUE)
-      ),
-      mean_sent_fomo       = mean(sent_fomo, na.rm = TRUE),
-      mean_sent_fear       = mean(sent_fear, na.rm = TRUE),
-      mean_sent_panic      = mean(sent_panic, na.rm = TRUE),
-      mean_sent_sarcasm    = mean(sent_sarcasm, na.rm = TRUE),
-      mean_sent_confidence = mean(sent_confidence, na.rm = TRUE),
-      mean_sent_anger      = mean(sent_anger, na.rm = TRUE),
-      mean_sent_regret     = mean(sent_regret, na.rm = TRUE),
-      share_rocket_emoji   = mean(has_rocket_emoji == 1, na.rm = TRUE),
-      share_moon_emoji     = mean(has_moon_emoji   == 1, na.rm = TRUE),
-      share_diamond_emoji  = mean(has_diamond_emoji == 1, na.rm = TRUE),
-      share_money_emoji    = mean(has_money_emoji  == 1, na.rm = TRUE),
-      avg_score            = mean(score, na.rm = TRUE),
-      avg_num_comments     = mean(num_comments, na.rm = TRUE),
-      .groups = "drop"
-    )
-}
-
-reddit_daily <- aggregate_reddit_to_daily(reddit_posts_ticker)
-message("Daily Reddit feature rows: ", nrow(reddit_daily))
-
-############################################################
-# 5. CREATE GOLD-STANDARD LABEL FROM PRICE DATA
-############################################################
+# ----------------------------------------------------------
+# 5) Label: meme_alert based on future return + volume spike
+# ----------------------------------------------------------
 
 create_meme_alert_label <- function(price_df,
-                                    return_threshold  = 0.03,
-                                    volume_multiplier = 1.3,
+                                    return_threshold  = 0.08,
+                                    volume_multiplier = 2,
                                     horizon_days      = 3) {
   price_df %>%
     arrange(ticker, date) %>%
     group_by(ticker) %>%
     mutate(
-      # Use slider::slide_* over the next H days
-      future_ret_max = slider::slide_dbl(
-        ret,
-        ~ max(.x, na.rm = TRUE),
-        .after   = horizon_days,
-        .before  = 0,
-        .complete = FALSE
-      ),
-      future_vol_max = slider::slide_dbl(
-        volume,
-        ~ max(.x, na.rm = TRUE),
-        .after   = horizon_days,
-        .before  = 0,
-        .complete = FALSE
-      ),
+      future_ret_max = slide_dbl(ret,    ~ max(.x, na.rm = TRUE), .after = horizon_days),
+      future_vol_max = slide_dbl(volume, ~ max(.x, na.rm = TRUE), .after = horizon_days),
       meme_alert = if_else(
         !is.na(future_ret_max) & !is.na(vol_ma20) &
           future_ret_max > return_threshold &
@@ -256,144 +166,98 @@ create_meme_alert_label <- function(price_df,
 
 price_labeled <- create_meme_alert_label(price_df)
 
-############################################################
-# 6. MERGE REDDIT FEATURES WITH PRICE + LABEL
-############################################################
+# ----------------------------------------------------------
+# 6) Merge features + label (final modelling dataset)
+# ----------------------------------------------------------
 
-df_model <- inner_join(
-  reddit_daily,
-  price_labeled,
-  by = c("ticker", "date")
-)
+df_model <- inner_join(reddit_daily, price_labeled, by = c("ticker", "date")) %>%
+  drop_na()
 
-message("Final modelling dataset rows: ", nrow(df_model))
+# ----------------------------------------------------------
+# 7) Time-based split (avoid leakage)
+# ----------------------------------------------------------
 
-############################################################
-# 7. TIME-BASED TRAIN/VAL/TEST SPLIT
-############################################################
-
-make_time_splits <- function(df_model, train_prop = 0.7, val_prop = 0.15) {
-  df_model  <- df_model %>% arrange(date)
-  all_dates <- sort(unique(df_model$date))
-  n_dates   <- length(all_dates)
+make_time_splits <- function(df, train_prop = 0.7, val_prop = 0.15) {
+  df <- df %>% arrange(date)
+  all_dates <- sort(unique(df$date))
+  n_dates <- length(all_dates)
   
-  train_end_idx <- floor(train_prop * n_dates)
-  val_end_idx   <- floor((train_prop + val_prop) * n_dates)
-  
-  train_dates <- all_dates[1:train_end_idx]
-  val_dates   <- all_dates[(train_end_idx + 1):val_end_idx]
-  test_dates  <- all_dates[(val_end_idx + 1):n_dates]
+  train_end <- floor(train_prop * n_dates)
+  val_end   <- floor((train_prop + val_prop) * n_dates)
   
   list(
-    train = df_model %>% filter(date %in% train_dates),
-    val   = df_model %>% filter(date %in% val_dates),
-    test  = df_model %>% filter(date %in% test_dates)
+    train = df %>% filter(date %in% all_dates[1:train_end]),
+    val   = df %>% filter(date %in% all_dates[(train_end + 1):val_end]),
+    test  = df %>% filter(date %in% all_dates[(val_end + 1):n_dates])
   )
 }
 
-df_model_clean <- df_model %>% drop_na()
-
-splits   <- make_time_splits(df_model_clean)
+splits <- make_time_splits(df_model)
 train_df <- splits$train
 val_df   <- splits$val
 test_df  <- splits$test
 
-message("Train rows: ", nrow(train_df),
-        " | Val rows: ", nrow(val_df),
-        " | Test rows: ", nrow(test_df))
-
-############################################################
-# 8. BASELINE MODEL: LOGISTIC REGRESSION (tidymodels)
-############################################################
+# ----------------------------------------------------------
+# 8) Logistic regression (tidymodels)
+# ----------------------------------------------------------
 
 train_logistic_model <- function(train_df) {
+  id_cols <- c("ticker", "date")
+  
   train_df <- train_df %>%
     mutate(meme_alert = factor(meme_alert, levels = c(0, 1)))
   
-  id_cols <- c("ticker", "date")
-  outcome <- "meme_alert"
-  
-  recipe_spec <- recipes::recipe(
-    as.formula(paste(outcome, "~ .")),
-    data = train_df %>% select(-all_of(id_cols))
-  ) %>%
-    update_role(meme_alert, new_role = "outcome") %>%
+  rec <- recipe(meme_alert ~ ., data = train_df %>% select(-all_of(id_cols))) %>%
     step_zv(all_predictors()) %>%
     step_normalize(all_numeric_predictors())
   
-  logit_spec <- logistic_reg(mode = "classification") %>%
-    set_engine("glm")
-  
   workflow() %>%
-    add_model(logit_spec) %>%
-    add_recipe(recipe_spec) %>%
+    add_recipe(rec) %>%
+    add_model(logistic_reg(mode = "classification") %>% set_engine("glm")) %>%
     fit(train_df)
 }
 
 logit_fit <- train_logistic_model(train_df)
 
-############################################################
-# 9. NEURAL NETWORK CLASSIFIER (torch MLP)
-############################################################
+# ----------------------------------------------------------
+# 9) Neural net (torch) with pos_weight
+# ----------------------------------------------------------
 
 train_nn_model <- function(train_df, val_df, epochs = 30, batch_size = 64, lr = 1e-3) {
   id_cols <- c("ticker", "date")
-  outcome <- "meme_alert"
   
-  # make sure meme_alert is numeric 0/1
   train_df <- train_df %>% mutate(meme_alert = as.numeric(meme_alert))
   val_df   <- val_df   %>% mutate(meme_alert = as.numeric(meme_alert))
   
-  # recipe: standardize predictors, but *not* the outcome
-  recipe_spec <- recipes::recipe(
-    as.formula(paste(outcome, "~ .")),
-    data = train_df %>% select(-all_of(id_cols))
-  ) %>%
-    update_role(meme_alert, new_role = "outcome") %>%
+  rec <- recipe(meme_alert ~ ., data = train_df %>% select(-all_of(id_cols))) %>%
     step_zv(all_predictors()) %>%
     step_normalize(all_numeric_predictors())
   
-  prep_rec <- prep(recipe_spec)
+  prep_rec <- prep(rec)
   
-  # helper: bake + convert to torch tensors
   df_to_tensors <- function(df) {
     baked <- bake(prep_rec, new_data = df)
+    x <- baked %>% select(-meme_alert) %>% as.matrix()
+    y <- baked$meme_alert
     
-    x_mat <- baked %>%
-      select(-meme_alert) %>%
-      as.matrix()
-    
-    y_vec <- baked$meme_alert
-    
-    # force to 0/1
-    y_vec <- ifelse(is.na(y_vec), 0, y_vec)
-    y_vec <- ifelse(y_vec > 0, 1, 0)
-    
-    # replace any non-finite values in predictors (NaN, Inf) by 0
-    x_mat[!is.finite(x_mat)] <- 0
+    x[!is.finite(x)] <- 0
+    y <- as.numeric(ifelse(y > 0, 1, 0))
     
     list(
-      x = torch_tensor(x_mat, dtype = torch_float()),
-      y = torch_tensor(as.numeric(y_vec), dtype = torch_float())
+      x = torch_tensor(x, dtype = torch_float()),
+      y = torch_tensor(y, dtype = torch_float())
     )
   }
   
-  train_t <- df_to_tensors(train_df)
-  val_t   <- df_to_tensors(val_df)
+  tr <- df_to_tensors(train_df)
+  va <- df_to_tensors(val_df)
   
-  x_train <- train_t$x
-  y_train <- train_t$y
-  x_val   <- val_t$x
-  y_val   <- val_t$y
+  n_train   <- tr$x$size()[1]
+  input_dim <- tr$x$size()[2]
   
-  n_train   <- x_train$size()[1]
-  input_dim <- x_train$size()[2]
-  
-  # ---- CLASS WEIGHTING: make positives more important ----
-  n_pos <- as.numeric((y_train == 1)$sum()$item())
+  n_pos <- as.numeric((tr$y == 1)$sum()$item())
   n_neg <- n_train - n_pos
   pos_weight_value <- if (n_pos > 0) n_neg / n_pos else 1
-  cat("Training NN with pos_weight =", pos_weight_value, "\n")
   
   Net <- nn_module(
     "Net",
@@ -405,13 +269,9 @@ train_nn_model <- function(train_df, val_df, epochs = 30, batch_size = 64, lr = 
     },
     forward = function(x) {
       x %>%
-        self$fc1() %>%
-        nnf_relu() %>%
-        self$drop() %>%
-        self$fc2() %>%
-        nnf_relu() %>%
-        self$drop() %>%
-        self$fc3()       # logits (no sigmoid)
+        self$fc1() %>% nnf_relu() %>% self$drop() %>%
+        self$fc2() %>% nnf_relu() %>% self$drop() %>%
+        self$fc3()
     }
   )
   
@@ -423,282 +283,311 @@ train_nn_model <- function(train_df, val_df, epochs = 30, batch_size = 64, lr = 
   
   for (epoch in seq_len(epochs)) {
     model$train()
+    idx <- sample.int(n_train)
     epoch_loss <- 0
     
-    idx <- sample.int(n_train)
     for (start in seq(1, n_train, by = batch_size)) {
       end <- min(start + batch_size - 1, n_train)
-      batch_idx <- idx[start:end]
+      b <- idx[start:end]
       
-      x_batch <- x_train[batch_idx, ]
-      y_batch <- y_train[batch_idx]$unsqueeze(2)  # shape [B, 1]
+      x_b <- tr$x[b, ]
+      y_b <- tr$y[b]$unsqueeze(2)
       
       optimizer$zero_grad()
-      logits <- model(x_batch)
-      loss   <- criterion(logits, y_batch)
+      loss <- criterion(model(x_b), y_b)
       loss$backward()
       optimizer$step()
       
       epoch_loss <- epoch_loss + as.numeric(loss$item())
     }
     
-    # validation loss
     model$eval()
     with_no_grad({
-      val_logits <- model(x_val)
-      val_loss   <- as.numeric(
-        criterion(val_logits, y_val$unsqueeze(2))$item()
-      )
+      val_loss <- as.numeric(criterion(model(va$x), va$y$unsqueeze(2))$item())
     })
     
-    cat(sprintf(
-      "Epoch %d/%d - train loss: %.4f - val loss: %.4f\n",
-      epoch, epochs, epoch_loss, val_loss
-    ))
+    cat(sprintf("Epoch %d/%d - train loss: %.4f - val loss: %.4f\n",
+                epoch, epochs, epoch_loss, val_loss))
   }
   
-  list(
-    model  = model,
-    recipe = prep_rec
-  )
+  list(model = model, recipe = prep_rec)
 }
 
 nn_result <- train_nn_model(train_df, val_df)
 
-############################################################
-# 10. THRESHOLD TUNING + EVALUATION HELPERS
-############################################################
+# ----------------------------------------------------------
+# 10) Threshold tuning + evaluation
+# ----------------------------------------------------------
 
-# --- Helper to tune classification threshold on validation set ----
 tune_threshold <- function(probs, truth_factor) {
   grid <- seq(0.05, 0.95, by = 0.05)
   
-  results <- purrr::map_df(grid, function(th) {
-    class_pred <- ifelse(probs >= th, "1", "0") %>%
-      factor(levels = c("0", "1"))
-    
-    metrics_df <- tibble(
-      truth       = truth_factor,
-      .pred_class = class_pred
-    )
-    
-    f1 <- f_meas(
-      metrics_df,
-      truth        = truth,
-      estimate     = .pred_class,
-      event_level  = "second"   # class "1" is the positive event
-    )$.estimate
-    
+  purrr::map_df(grid, function(th) {
+    pred <- factor(ifelse(probs >= th, "1", "0"), levels = c("0", "1"))
+    f1 <- f_meas(tibble(truth = truth_factor, pred = pred),
+                 truth = truth, estimate = pred, event_level = "second")$.estimate
     tibble(threshold = th, f1 = f1)
-  })
-  
-  results %>%
+  }) %>%
     filter(f1 == max(f1, na.rm = TRUE)) %>%
     slice(1)
 }
 
-# --- Logistic regression evaluation (with custom threshold) ----
-evaluate_logit <- function(fit, df, threshold = 0.5) {
-  df_eval <- df %>%
-    mutate(meme_alert = factor(meme_alert, levels = c(0, 1)))
+evaluate_with_threshold <- function(truth, probs, threshold) {
+  pred <- factor(ifelse(probs >= threshold, "1", "0"), levels = c("0", "1"))
+  dfm <- tibble(truth = truth, .pred_1 = probs, .pred_class = pred)
   
-  probs <- predict(fit, new_data = df_eval, type = "prob")$.pred_1
-  class_pred <- ifelse(probs >= threshold, "1", "0") %>%
-    factor(levels = c("0", "1"))
-  
-  metrics_df <- tibble(
-    truth       = df_eval$meme_alert,
-    .pred_1     = probs,
-    .pred_class = class_pred
+  list(
+    metrics = tibble(
+      accuracy  = accuracy(dfm, truth, .pred_class)$.estimate,
+      precision = precision(dfm, truth, .pred_class, event_level = "second")$.estimate,
+      recall    = recall(dfm, truth, .pred_class, event_level = "second")$.estimate,
+      f1        = f_meas(dfm, truth, .pred_class, event_level = "second")$.estimate,
+      roc_auc   = roc_auc(dfm, truth, .pred_1, event_level = "second")$.estimate
+    ),
+    confusion = conf_mat(dfm, truth, .pred_class)
   )
-  
-  metrics_list <- list(
-    accuracy  = accuracy(metrics_df, truth = truth, estimate = .pred_class),
-    precision = precision(metrics_df, truth = truth, estimate = .pred_class,
-                          event_level = "second"),
-    recall    = recall(metrics_df, truth = truth, estimate = .pred_class,
-                       event_level = "second"),
-    f_meas    = f_meas(metrics_df, truth = truth, estimate = .pred_class,
-                       event_level = "second"),
-    roc_auc   = roc_auc(
-      metrics_df,
-      truth = truth,
-      .pred_1,
-      event_level = "second"   # class "1" is the event
-    )
-  )
-  
-  metrics_tbl <- bind_rows(metrics_list) %>%
-    select(.metric, .estimate)
-  
-  conf <- conf_mat(metrics_df, truth = truth, estimate = .pred_class)
-  
-  list(metrics = metrics_tbl, confusion = conf)
 }
 
-# --- Torch neural net evaluation (with custom threshold) ----
-evaluate_nn <- function(nn_result, df, threshold = 0.5) {
-  df_proc <- df %>%
-    mutate(meme_alert = as.numeric(meme_alert))
-  
-  baked <- bake(nn_result$recipe, new_data = df_proc)
-  
-  x <- baked %>% select(-meme_alert) %>% as.matrix()
-  y <- baked$meme_alert
-  
-  x_tensor <- torch_tensor(x, dtype = torch_float())
-  
-  probs <- nn_result$model(x_tensor) %>%
-    torch_sigmoid() %>%
-    as_array() %>%
-    as.numeric()
-  
-  class_pred <- ifelse(probs >= threshold, "1", "0") %>%
-    factor(levels = c("0", "1"))
-  
-  metrics_df <- tibble(
-    truth       = factor(y, levels = c(0, 1)),
-    .pred_1     = probs,
-    .pred_class = class_pred
-  )
-  
-  metrics_list <- list(
-    accuracy  = accuracy(metrics_df, truth = truth, estimate = .pred_class),
-    precision = precision(metrics_df, truth = truth, estimate = .pred_class,
-                          event_level = "second"),
-    recall    = recall(metrics_df, truth = truth, estimate = .pred_class,
-                       event_level = "second"),
-    f_meas    = f_meas(metrics_df, truth = truth, estimate = .pred_class,
-                       event_level = "second"),
-    roc_auc   = roc_auc(metrics_df, truth = truth, .pred_1)
-  )
-  
-  metrics_tbl <- bind_rows(metrics_list) %>%
-    select(.metric, .estimate)
-  
-  conf <- conf_mat(metrics_df, truth = truth, estimate = .pred_class)
-  
-  list(metrics = metrics_tbl, confusion = conf)
-}
+# Validation probabilities
+val_truth <- factor(val_df$meme_alert, levels = c(0, 1))
 
-############################################################
-# 11. TUNE THRESHOLDS ON VALIDATION SET
-############################################################
+val_probs_logit <- predict(
+  logit_fit,
+  new_data = val_df %>% mutate(meme_alert = val_truth),
+  type = "prob"
+)$.pred_1
 
-# ---- Logistic: best threshold on val ----
-val_eval_logit <- val_df %>%
-  mutate(meme_alert = factor(meme_alert, levels = c(0, 1)))
-
-val_probs_logit <- predict(logit_fit, new_data = val_eval_logit, type = "prob")$.pred_1
-
-best_th_logit <- tune_threshold(val_probs_logit, val_eval_logit$meme_alert)
-cat("Best logistic threshold (val):\n")
-print(best_th_logit)
-
-# ---- NN: best threshold on val ----
-val_proc_nn  <- val_df %>%
-  mutate(meme_alert = as.numeric(meme_alert))
-
-baked_val_nn <- bake(nn_result$recipe, new_data = val_proc_nn)
-
+baked_val_nn <- bake(nn_result$recipe, new_data = val_df %>% mutate(meme_alert = as.numeric(meme_alert)))
 x_val_nn <- baked_val_nn %>% select(-meme_alert) %>% as.matrix()
-y_val_nn <- baked_val_nn$meme_alert
 
 val_probs_nn <- nn_result$model(torch_tensor(x_val_nn, dtype = torch_float())) %>%
-  torch_sigmoid() %>%
-  as_array() %>%
-  as.numeric()
+  torch_sigmoid() %>% as_array() %>% as.numeric()
 
-best_th_nn <- tune_threshold(val_probs_nn, factor(y_val_nn, levels = c(0, 1)))
-cat("Best NN threshold (val):\n")
-print(best_th_nn)
+best_th_logit <- tune_threshold(val_probs_logit, val_truth)
+best_th_nn    <- tune_threshold(val_probs_nn,    val_truth)
 
-############################################################
-# 12. FINAL EVALUATION ON TEST SET (USING TUNED THRESHOLDS)
-############################################################
+# Test probabilities
+test_truth <- factor(test_df$meme_alert, levels = c(0, 1))
 
-logit_eval_test <- evaluate_logit(
+test_probs_logit <- predict(
   logit_fit,
-  test_df,
-  threshold = best_th_logit$threshold
+  new_data = test_df %>% mutate(meme_alert = test_truth),
+  type = "prob"
+)$.pred_1
+
+baked_test_nn <- bake(nn_result$recipe, new_data = test_df %>% mutate(meme_alert = as.numeric(meme_alert)))
+x_test_nn <- baked_test_nn %>% select(-meme_alert) %>% as.matrix()
+
+test_probs_nn <- nn_result$model(torch_tensor(x_test_nn, dtype = torch_float())) %>%
+  torch_sigmoid() %>% as_array() %>% as.numeric()
+
+logit_eval_test <- evaluate_with_threshold(test_truth, test_probs_logit, best_th_logit$threshold)
+nn_eval_test    <- evaluate_with_threshold(test_truth, test_probs_nn,    best_th_nn$threshold)
+
+print(logit_eval_test$metrics); print(logit_eval_test$confusion)
+print(nn_eval_test$metrics);    print(nn_eval_test$confusion)
+
+# ----------------------------------------------------------
+# 11) Model plots (test set)
+# ----------------------------------------------------------
+
+test_pred_df <- tibble(
+  truth      = factor(test_truth, levels = c("0", "1")),
+  prob_logit = test_probs_logit,
+  prob_nn    = test_probs_nn
 )
 
-nn_eval_test <- evaluate_nn(
-  nn_result,
-  test_df,
-  threshold = best_th_nn$threshold
-)
-
-print("Logistic regression metrics (test):")
-print(logit_eval_test$metrics)
-print(logit_eval_test$confusion)
-
-print("Neural net (torch) metrics (test):")
-print(nn_eval_test$metrics)
-print(nn_eval_test$confusion)
-
-############################################################
-# 13. VISUAL SUMMARY PLOT (TEST SET)
-############################################################
-
-# Combine main metrics (excluding roc_auc) into one table
+# 11.1 Metrics bar
 metrics_plot_df <- bind_rows(
-  logit_eval_test$metrics %>%
-    mutate(model = "Logistic regression"),
-  nn_eval_test$metrics %>%
-    mutate(model = "Neural net (torch)")
+  tibble(model = "Logistic", value = as.numeric(logit_eval_test$metrics[1, ]), metric = names(logit_eval_test$metrics)) %>%
+    select(model, metric, value),
+  tibble(model = "Neural net", value = as.numeric(nn_eval_test$metrics[1, ]), metric = names(nn_eval_test$metrics)) %>%
+    select(model, metric, value)
 ) %>%
-  filter(.metric %in% c("accuracy", "precision", "recall", "f_meas")) %>%
-  mutate(
-    .metric = factor(
-      .metric,
-      levels = c("accuracy", "precision", "recall", "f_meas"),
-      labels = c("Accuracy", "Precision", "Recall", "F1-score")
-    )
-  )
+  filter(metric %in% c("accuracy", "precision", "recall", "f1"))
 
-# Bar plot comparing models on the test set
-ggplot(metrics_plot_df, aes(x = .metric, y = .estimate, fill = model)) +
+p_metrics <- ggplot(metrics_plot_df, aes(x = metric, y = value, fill = model)) +
   geom_col(position = position_dodge(width = 0.7)) +
   geom_text(
-    aes(label = round(.estimate, 3)),
+    aes(label = sprintf("%.3f", value)),
     position = position_dodge(width = 0.7),
-    vjust = -0.3,
+    vjust = -0.35,
     size = 3
   ) +
-  ylim(0, 1) +
+  coord_cartesian(ylim = c(0, 1)) +
   labs(
-    title    = "Test-set performance: Logistic vs Neural Net",
-    x        = "Metric",
-    y        = "Score",
-    fill     = "Model"
+    title = "Test performance (threshold tuned on validation)",
+    x = NULL, y = "Score", fill = "Model"
   ) +
   theme_minimal(base_size = 12) +
-  theme(
-    plot.title   = element_text(hjust = 0.5),
-    legend.position = "bottom"
-  )
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
 
-# (Optional) Save to file for your thesis/report
-ggsave("model_comparison_test_metrics.png", width = 7, height = 4)
+print(p_metrics)
+ggsave("plot_test_metrics_bar.png", p_metrics, width = 7, height = 4)
 
-############################################################
-# 14. SAVE OUTPUTS
-############################################################
+# 11.2 ROC curves
+roc_logit <- roc_curve(test_pred_df, truth, prob_logit, event_level = "second") %>% mutate(model = "Logistic")
+roc_nn    <- roc_curve(test_pred_df, truth, prob_nn,    event_level = "second") %>% mutate(model = "Neural net")
 
-readr::write_csv(df_model, "meme_asset_day_dataset_with_llm_scores.csv")
-saveRDS(logit_fit, "logistic_meme_model.rds")
-saveRDS(nn_result, "nn_meme_model_torch.rds")  # torch model + recipe
+p_roc <- bind_rows(roc_logit, roc_nn) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_abline(linetype = "dashed") +
+  labs(title = "ROC curves (test set)",
+       x = "False Positive Rate", y = "True Positive Rate", color = "Model") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
 
-# Helper for single-row prediction (logistic) --------------
-predict_meme_alert_for_row <- function(logit_fit, new_row) {
-  probs <- predict(logit_fit, new_data = new_row, type = "prob")$.pred_1
-  tibble(
-    prob_meme_alert  = probs,
-    class_meme_alert = ifelse(probs >= 0.5, 1, 0)
-  )
+print(p_roc)
+ggsave("plot_test_roc.png", p_roc, width = 7, height = 4)
+
+# 11.3 Precision–Recall curves
+pr_logit <- pr_curve(test_pred_df, truth, prob_logit, event_level = "second") %>% mutate(model = "Logistic")
+pr_nn    <- pr_curve(test_pred_df, truth, prob_nn,    event_level = "second") %>% mutate(model = "Neural net")
+
+p_pr <- bind_rows(pr_logit, pr_nn) %>%
+  ggplot(aes(x = recall, y = precision, color = model)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Precision–Recall curves (test set)",
+       x = "Recall", y = "Precision", color = "Model") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+
+print(p_pr)
+ggsave("plot_test_pr.png", p_pr, width = 7, height = 4)
+
+# 11.4 Score distributions
+scores_long <- test_pred_df %>%
+  pivot_longer(cols = c(prob_logit, prob_nn), names_to = "model", values_to = "prob") %>%
+  mutate(model = recode(model, prob_logit = "Logistic", prob_nn = "Neural net"))
+
+p_dist <- ggplot(scores_long, aes(x = prob, fill = truth)) +
+  geom_histogram(bins = 30, position = "identity", alpha = 0.5) +
+  facet_wrap(~ model, ncol = 1) +
+  labs(title = "Predicted probability distributions (test set)",
+       x = "Predicted P(meme_alert = 1)", y = "Count", fill = "True class") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p_dist)
+ggsave("plot_test_prob_distributions.png", p_dist, width = 7, height = 6)
+
+# ----------------------------------------------------------
+# 12) Backtest / directionality (Reddit leads vs reacts)
+# ----------------------------------------------------------
+
+run_backtest <- function(df_model,
+                         signal_col = "num_posts",
+                         z_thresh = 2,
+                         price_jump_thresh = 0.05,
+                         max_lag = 10) {
+  
+  df_bt <- df_model %>%
+    arrange(ticker, date) %>%
+    group_by(ticker) %>%
+    mutate(
+      reddit_signal = .data[[signal_col]],
+      reddit_z      = zscore(reddit_signal),
+      
+      ret_fwd_1 = lead(ret, 1),
+      ret_fwd_3 = slide_dbl(ret, ~ sum(.x, na.rm = TRUE), .before = 1, .after = 3, .complete = TRUE),
+      ret_fwd_5 = slide_dbl(ret, ~ sum(.x, na.rm = TRUE), .before = 1, .after = 5, .complete = TRUE)
+    ) %>%
+    ungroup()
+  
+  # --- Reddit spike event study
+  df_spike <- df_bt %>%
+    filter(is.finite(reddit_z)) %>%
+    mutate(is_spike = reddit_z >= z_thresh)
+  
+  event_long <- df_spike %>%
+    filter(is_spike) %>%
+    summarise(
+      `+1d` = mean(ret_fwd_1, na.rm = TRUE),
+      `+3d` = mean(ret_fwd_3, na.rm = TRUE),
+      `+5d` = mean(ret_fwd_5, na.rm = TRUE)
+    ) %>%
+    pivot_longer(everything(), names_to = "horizon", values_to = "avg_fwd_ret")
+  
+  p_event <- ggplot(event_long, aes(x = horizon, y = avg_fwd_ret)) +
+    geom_col() +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(
+      title = paste0("Event study: Reddit spike (z≥", z_thresh, ") → future returns"),
+      subtitle = paste0("Signal = ", signal_col, " | z-scored per ticker"),
+      x = "Horizon after spike day",
+      y = "Average cumulative return"
+    ) +
+    theme_minimal(base_size = 12)
+  
+  # --- Price jump → future Reddit
+  df_rev <- df_bt %>%
+    group_by(ticker) %>%
+    mutate(
+      is_price_jump = ret >= price_jump_thresh,
+      reddit_z_fwd_1 = lead(reddit_z, 1),
+      reddit_z_fwd_3 = slide_dbl(reddit_z, ~ mean(.x, na.rm = TRUE), .before = 1, .after = 3, .complete = TRUE),
+      reddit_z_fwd_5 = slide_dbl(reddit_z, ~ mean(.x, na.rm = TRUE), .before = 1, .after = 5, .complete = TRUE)
+    ) %>%
+    ungroup()
+  
+  rev_long <- df_rev %>%
+    filter(is_price_jump) %>%
+    summarise(
+      `+1d` = mean(reddit_z_fwd_1, na.rm = TRUE),
+      `+3d` = mean(reddit_z_fwd_3, na.rm = TRUE),
+      `+5d` = mean(reddit_z_fwd_5, na.rm = TRUE)
+    ) %>%
+    pivot_longer(everything(), names_to = "horizon", values_to = "avg_reddit_z")
+  
+  p_reverse <- ggplot(rev_long, aes(x = horizon, y = avg_reddit_z)) +
+    geom_col() +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(
+      title = paste0("Reverse check: Price jump (ret≥", price_jump_thresh, ") → future Reddit activity"),
+      subtitle = paste0("Signal = ", signal_col, " | z-scored per ticker"),
+      x = "Horizon after price jump day",
+      y = "Average Reddit z-score"
+    ) +
+    theme_minimal(base_size = 12)
+  
+  # --- Lead–lag correlation curve
+  lags <- -max_lag:max_lag
+  corr_df <- purrr::map_df(lags, function(k) {
+    tmp <- df_bt %>%
+      group_by(ticker) %>%
+      mutate(ret_shift = if (k >= 0) lead(ret, k) else lag(ret, -k)) %>%
+      ungroup() %>%
+      filter(is.finite(reddit_z), is.finite(ret_shift))
+    
+    tibble(
+      lag  = k,
+      corr = cor(tmp$reddit_z, tmp$ret_shift, use = "complete.obs")
+    )
+  })
+  
+  p_lag <- ggplot(corr_df, aes(x = lag, y = corr)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(
+      title = "Lead–lag correlation: Reddit activity vs returns",
+      subtitle = paste0("Positive lag = Reddit today vs returns in +k days | Signal = ", signal_col),
+      x = "Lag k (days)",
+      y = "Correlation corr(reddit_z[t], ret[t+k])"
+    ) +
+    theme_minimal(base_size = 12)
+  
+  list(p_event = p_event, p_reverse = p_reverse, p_lag = p_lag)
 }
 
-############################################################
-# End of script.
-############################################################
+bt <- run_backtest(df_model, signal_col = "num_posts", z_thresh = 2, price_jump_thresh = 0.05, max_lag = 10)
+
+print(bt$p_event)
+ggsave("backtest_reddit_spike_future_returns.png", bt$p_event, width = 7, height = 4)
+
+print(bt$p_reverse)
+ggsave("backtest_price_jump_future_reddit.png", bt$p_reverse, width = 7, height = 4)
+
+print(bt$p_lag)
+ggsave("backtest_lead_lag_correlation.png", bt$p_lag, width = 7, height = 4)
