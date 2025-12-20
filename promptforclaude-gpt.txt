@@ -1,0 +1,106 @@
+# this is a Prompt idea for the code we need to write for the "inner" prompt
+# 
+
+
+Produce production-quality R code (one R script plus any helper functions in the same file unless you strongly prefer a small package-like structure) to run sentiment + meme-stock feature extraction on a Reddit dataset named "dataset_meme_reddit_historical_1".
+
+GOAL
+- Input: dataset_meme_reddit_historical_1 (Reddit messages).
+- Output: a new dataset with one row per message, adding:
+  - inferred_tickers (vector/list column, or a delimited string)
+  - ticker_confidences (aligned to inferred_tickers)
+  - ticker_inference_method (explicit_mention | implicit_company_reference | context_inferred | none)
+  - and numeric scores per message: hype, positivity, negativity, overall_sentiment, sarcasm, irony, uncertainty, urgency, FOMO, “diamond_hands” / “paper_hands” vibe, and “call_to_action” (e.g., buy/hold/sell/YOLO).
+  - plus optional flags: contains_price_target, contains_options_talk, mentions_short_squeeze, mentions_gamma_squeeze, mentions_earnings, mentions_sec_or_regulatory, etc.
+The downstream goal (done elsewhere) is to predict which stocks become next meme stocks.
+
+CRITICAL REQUIREMENTS
+1) Use the OpenAI API with the Responses endpoint:
+   - POST https://api.openai.com/v1/responses
+   - Use Bearer auth from env var OPENAI_API_KEY
+   - Use model "gpt-5-nano"
+   Reference requirements in code comments.
+2) Use Structured Outputs (JSON schema) so the model returns strictly valid JSON with required fields.
+3) Do NOT hardcode secrets. Read OPENAI_API_KEY from env.
+4) The dataset may be large. Design for scale:
+   - batching / chunking
+   - retries with exponential backoff on 429/5xx
+   - deterministic caching (so reruns don’t re-call the API for already-processed message_ids)
+   - progress reporting
+5) The LLM must:
+   - detect companies/tickers explicitly mentioned (e.g., $TSLA, “AAPL”, “Tesla”)
+   - detect implicit references where the company isn’t explicitly named (e.g., “the movie theater stock”, “the videogame retailer”, “that EV company”)
+6) For messages with NO company/ticker found (“non-mentioned messages”):
+   - infer likely tickers by looking at messages “around the same time” that do mention tickers and appear to discuss the same thing.
+   - Implement this in code by retrieving a context window (e.g., +/- 6 hours, adjustable), then selecting the top K most text-similar context messages that contain tickers, and provide those as context to the LLM when classifying the non-mentioned message.
+   - Similarity can be implemented via:
+     - embeddings (preferred if you can do it cleanly), OR
+     - a strong lexical baseline (TF-IDF cosine), if you want to avoid embeddings.
+   - The algorithm should be explicit and reproducible, with parameters (window_hours, K).
+7) “Inner prompt”: You must write the inner prompt text that will be sent to GPT-5 Nano. IMPORTANT: in your final response, include that prompt as an R character string (or a function that builds it). The user explicitly wants YOU (Claude) to write the inner prompt; do not ask the user to write it.
+
+DATASET ASSUMPTIONS (handle flexibly)
+- dataset_meme_reddit_historical_1 is available either as:
+  a) an R object already in memory, OR
+  b) a file path the user can set (CSV/Parquet/RDS).
+- Do not assume exact column names; instead:
+  - write a small “column mapping” step that detects likely columns:
+    message_id / id, created_utc / created_at / timestamp, body / text, subreddit, author
+  - If ambiguous, default sensibly and document how to override.
+
+PIPELINE DESIGN (produce code accordingly)
+A) Load + normalize data
+   - Ensure timestamps are POSIXct
+   - Standardize text (keep raw_text + cleaned_text)
+B) Pre-pass ticker extraction (cheap heuristic)
+   - Regex for cashtags: \\$[A-Z]{1,5}
+   - Regex for “ticker-like tokens” (all caps 1–5) but reduce false positives (e.g., “DD”, “YOLO”)
+   - Optional: dictionary mapping common meme references (“movie theater stock” -> AMC, “videogame retailer” -> GME) — implement as a small editable lookup table in code.
+C) Build context index for non-mentioned messages
+   - For each non-mentioned message, find candidate context messages within +/- window_hours that have tickers.
+   - Rank by similarity and keep top K, store their texts + tickers as context.
+D) LLM classification call (Responses API with Structured Outputs)
+   - For messages with tickers: include message text and extracted candidates.
+   - For non-mentioned messages: include message text plus the selected context snippets.
+   - The model must output a strict JSON object per message with:
+     - tickers: [{ticker, confidence, evidence (short), method}]
+     - scores: all numeric in [0,1] (or clearly specified scale)
+     - categorical labels if useful (e.g., sentiment_label: negative/neutral/positive)
+     - rationale: very short (<= 25 words), optional, but keep output compact
+   - Make sure the schema forbids extra keys (or otherwise is strict).
+E) Merge outputs back into a final dataframe
+F) Save outputs to disk (CSV + Parquet recommended), with reproducible filenames.
+
+OPENAI API DETAILS (must implement)
+- Endpoint: https://api.openai.com/v1/responses
+- Auth header: Authorization: Bearer <OPENAI_API_KEY>
+- Use httr2 (preferred) or httr; use jsonlite for JSON.
+- Include max_output_tokens and a temperature choice appropriate for classification (low).
+- Include a “validate_json_schema” or “stop if invalid” step (structured outputs should ensure validity, but still guard).
+- Parse the response robustly and extract the JSON payload.
+- Provide comments explaining how to set OPENAI_API_KEY.
+
+DELIVERABLES IN YOUR RESPONSE
+1) Provide the full R code.
+2) Inside the R code, include the full inner prompt you wrote for GPT-5 Nano.
+3) Provide a short “How to run” section at the top as comments:
+   - install packages
+   - set OPENAI_API_KEY
+   - set input path or object
+   - run pipeline
+4) Keep everything simple and readable. No unnecessary complexity.
+
+EDGE CASES YOU MUST HANDLE
+- Deleted/empty messages
+- Very long messages (truncate safely while preserving meaning)
+- Messages mentioning multiple tickers
+- Sarcasm/irony typical to WSB-style language
+- Non-English messages (at least don’t crash; score them anyway)
+- Prevent obvious hallucinations: if you can’t infer a ticker confidently, return none with low confidence.
+
+IMPORTANT OUTPUT CONVENTIONS
+- Scores must be numeric and consistent across all rows.
+- For “hype”, interpret as intensity/excitement/viral energy, not just positive sentiment.
+- For sarcasm and irony, interpret as rhetorical/semantic mismatch signals common in meme finance.
+
+Now write the R code accordingly.
