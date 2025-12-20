@@ -12,7 +12,7 @@ library(torch)
 set.seed(123)
 
 reddit_path <- "~/Documents/PEE/LLM_dataset.csv"
-price_path  <- "~/Documents/PEE/price_yahoo_dataset.csv"
+price_path  <- "~/Documents/PEE/price_yahoo_dataset(2).csv"
 
 # ----------------------------------------------------------
 # Helpers
@@ -41,26 +41,21 @@ load_and_prepare_prices <- function(price_path) {
   names(price_raw) <- tolower(names(price_raw))
   
   price_raw <- price_raw %>%
-    ensure_col("ticker", c("symbol")) %>%
-    ensure_col("date",   c("timestamp")) %>%
-    ensure_col("close",  c("adjclose", "adj_close"))
-  
-  if (!"volume" %in% names(price_raw)) stop("Missing column 'volume'.")
+    ensure_col("ticker", c("symbol", "tick", "ticker")) %>%
+    ensure_col("date",   c("timestamp", "datetime", "date")) %>%
+    ensure_col("close",  c("adjclose", "adj_close", "close")) %>%
+    ensure_col("daily_change", c("ret", "return", "daily_return")) %>%
+    ensure_col("rolling_vol_20d", c("rolling_vol_20", "vol_20d", "sigma20"))
   
   price_raw %>%
     mutate(
       ticker = toupper(as.character(ticker)),
-      date   = as.Date(date)
+      date   = as.Date(date),
+      # daily_change in your file looks like percent units (e.g., 18.8 = +18.8%)
+      ret    = daily_change / 100
     ) %>%
     arrange(ticker, date) %>%
-    group_by(ticker) %>%
-    mutate(
-      ret      = if ("ret" %in% names(.)) ret else close / lag(close) - 1,
-      vol_ma20 = if ("vol_ma20" %in% names(.)) vol_ma20 else
-        slider::slide_dbl(volume, mean, .before = 19, .complete = TRUE)
-    ) %>%
-    ungroup() %>%
-    select(ticker, date, close, volume, ret, vol_ma20)
+    select(ticker, date, close, ret, rolling_vol_5d, rolling_vol_10d, rolling_vol_20d)
 }
 
 price_df <- load_and_prepare_prices(price_path)
@@ -145,19 +140,23 @@ reddit_daily <- reddit_posts_ticker %>%
 # ----------------------------------------------------------
 
 create_meme_alert_label <- function(price_df,
-                                    return_threshold  = 0.08,
-                                    volume_multiplier = 2,
-                                    horizon_days      = 3) {
+                                    return_threshold   = 0.08,  # +8%
+                                    vol_multiplier     = 1.8,   # volatility spike factor
+                                    horizon_days       = 6) {
+  
   price_df %>%
     arrange(ticker, date) %>%
     group_by(ticker) %>%
     mutate(
-      future_ret_max = slide_dbl(ret,    ~ max(.x, na.rm = TRUE), .after = horizon_days),
-      future_vol_max = slide_dbl(volume, ~ max(.x, na.rm = TRUE), .after = horizon_days),
-      meme_alert = if_else(
-        !is.na(future_ret_max) & !is.na(vol_ma20) &
+      future_ret_max = slider::slide_dbl(ret, ~ max(.x, na.rm = TRUE),
+                                         .after = horizon_days, .complete = TRUE),
+      future_vol_max = slider::slide_dbl(rolling_vol_5d, ~ max(.x, na.rm = TRUE),
+                                         .after = horizon_days, .complete = TRUE),
+      
+      meme_alert = dplyr::if_else(
+        !is.na(future_ret_max) & !is.na(rolling_vol_20d) &
           future_ret_max > return_threshold &
-          future_vol_max > volume_multiplier * vol_ma20,
+          future_vol_max > vol_multiplier * rolling_vol_20d,
         1L, 0L
       )
     ) %>%
@@ -257,15 +256,15 @@ train_nn_model <- function(train_df, val_df, epochs = 30, batch_size = 64, lr = 
   
   n_pos <- as.numeric((tr$y == 1)$sum()$item())
   n_neg <- n_train - n_pos
-  pos_weight_value <- if (n_pos > 0) n_neg / n_pos else 1
+  pos_weight_value <- if (n_pos > 0) min(n_neg / n_pos, 10) else 1
   
   Net <- nn_module(
     "Net",
     initialize = function(input_dim) {
-      self$fc1  <- nn_linear(input_dim, 64)
-      self$fc2  <- nn_linear(64, 32)
-      self$fc3  <- nn_linear(32, 1)
-      self$drop <- nn_dropout(p = 0.3)
+      self$fc1  <- nn_linear(input_dim, 32)
+      self$fc2  <- nn_linear(32, 16)
+      self$fc3  <- nn_linear(16, 1)
+      self$drop <- nn_dropout(p = 0.5)
     },
     forward = function(x) {
       x %>%
@@ -276,10 +275,15 @@ train_nn_model <- function(train_df, val_df, epochs = 30, batch_size = 64, lr = 
   )
   
   model     <- Net(input_dim)
-  optimizer <- optim_adam(model$parameters, lr = lr)
+  optimizer <- optim_adam(model$parameters, lr = lr, weight_decay = 1e-4)
   criterion <- nn_bce_with_logits_loss(
     pos_weight = torch_tensor(pos_weight_value, dtype = torch_float())
   )
+  
+  best_val <- Inf
+  patience <- 5
+  pat_left <- patience
+  best_state <- NULL
   
   for (epoch in seq_len(epochs)) {
     model$train()
@@ -308,7 +312,21 @@ train_nn_model <- function(train_df, val_df, epochs = 30, batch_size = 64, lr = 
     
     cat(sprintf("Epoch %d/%d - train loss: %.4f - val loss: %.4f\n",
                 epoch, epochs, epoch_loss, val_loss))
+    
+    if (val_loss < best_val - 1e-3) {
+      best_val <- val_loss
+      pat_left <- patience
+      best_state <- model$state_dict()
+    } else {
+      pat_left <- pat_left - 1
+      if (pat_left <= 0) {
+        cat("Early stopping.\n")
+        break
+      }
+    }
   }
+  
+  if (!is.null(best_state)) model$load_state_dict(best_state)
   
   list(model = model, recipe = prep_rec)
 }
@@ -320,16 +338,20 @@ nn_result <- train_nn_model(train_df, val_df)
 # ----------------------------------------------------------
 
 tune_threshold <- function(probs, truth_factor) {
-  grid <- seq(0.05, 0.95, by = 0.05)
+  grid <- seq(0.01, 0.99, by = 0.01)
   
   purrr::map_df(grid, function(th) {
     pred <- factor(ifelse(probs >= th, "1", "0"), levels = c("0", "1"))
+    
+    # skip thresholds that predict no positives
+    if (sum(pred == "1") == 0) return(tibble(threshold = th, f1 = NA_real_))
+    
     f1 <- f_meas(tibble(truth = truth_factor, pred = pred),
                  truth = truth, estimate = pred, event_level = "second")$.estimate
     tibble(threshold = th, f1 = f1)
   }) %>%
-    filter(f1 == max(f1, na.rm = TRUE)) %>%
-    slice(1)
+    filter(!is.na(f1)) %>%
+    slice_max(f1, n = 1, with_ties = FALSE)
 }
 
 evaluate_with_threshold <- function(truth, probs, threshold) {
@@ -473,7 +495,7 @@ print(p_dist)
 ggsave("plot_test_prob_distributions.png", p_dist, width = 7, height = 6)
 
 # ----------------------------------------------------------
-# 12) Backtest / directionality (Reddit leads vs reacts)
+# 12) Backtest/directionality (Reddit leads vs reacts)
 # ----------------------------------------------------------
 
 run_backtest <- function(df_model,
@@ -587,6 +609,10 @@ print(bt$p_event)
 ggsave("backtest_reddit_spike_future_returns.png", bt$p_event, width = 7, height = 4)
 
 print(bt$p_reverse)
+ggsave("backtest_price_jump_future_reddit.png", bt$p_reverse, width = 7, height = 4)
+
+print(bt$p_lag)
+ggsave("backtest_lead_lag_correlation.png", bt$p_lag, width = 7, height = 4)
 ggsave("backtest_price_jump_future_reddit.png", bt$p_reverse, width = 7, height = 4)
 
 print(bt$p_lag)
