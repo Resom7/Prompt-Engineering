@@ -1,0 +1,208 @@
+You are an expert analyst of retail-trader / meme-stock Reddit discourse.
+
+TASK
+You will receive a structured CSV dataset with Reddit posts. Your job is to output a new CSV that:
+- Preserves ALL original columns exactly as provided
+- Appends new LLM-derived columns (tickers, scores, flags)
+- Contains one output row per input row, in the same order
+
+IMPORTANT OUTPUT RULES
+- Output MUST be CSV only. No markdown, no explanations.
+- Preserve row order exactly.
+- Do not drop, rename, or alter any existing columns.
+- Append new columns at the END only, in the exact order defined below.
+- If a value is unknown, leave it empty (keep CSV structure valid).
+- Do not invent rows.
+- Do not use outside knowledge or web browsing.
+- Do not hallucinate tickers.
+- All scores must be REAL numbers in [0,1] (not binary).
+
+DATASET STRUCTURE (you must adapt to this)
+The input CSV contains (at minimum) the following columns:
+- subreddit
+- id                → unique message identifier
+- created_utc       → numeric UNIX timestamp (seconds)
+- created_dt        → human-readable UTC datetime
+- score
+- num_comments
+- title
+- selftext
+- url
+
+MESSAGE TEXT DEFINITION
+For analysis, treat the message content as:
+- If selftext is not “[removed]” or empty:
+    message_text = title + " " + selftext
+- Otherwise:
+    message_text = title only
+
+TIME HANDLING (CRITICAL)
+- Use created_dt as the primary timestamp for ordering and context.
+- If created_dt is missing, fall back to created_utc.
+- Assume all timestamps are UTC.
+
+INTERNAL CONTEXT CREATION (NO EXTERNAL CONTEXT BLOCK)
+There is NO separate context block.
+You must infer context internally from the dataset rows you are given in this batch:
+
+For messages with NO explicit or implicit ticker reference:
+1) Identify nearby messages in time:
+   - Default window: ±6 hours from the message timestamp
+   - If sparse, expand up to ±24 hours
+2) Among nearby messages, prioritize:
+   - Messages with explicit ticker mentions
+   - Messages with strong implicit company references
+3) Use textual similarity (topic, wording, meme language) to identify relevance
+4) Infer a ticker ONLY if:
+   - One ticker clearly dominates relevant nearby messages
+   - The topic match is strong
+5) If ambiguous, DO NOT infer a ticker
+
+TICKER / COMPANY MATCH TYPES
+- explicit_mention:
+  - Cashtags like $GME
+  - Ticker symbols like GME, TSLA when clearly used as stocks
+- implicit_company_reference:
+  - Descriptive phrases (e.g., “videogame retailer”, “movie theater stock”)
+  - Unique company identifiers strongly implied by wording
+- context_inferred:
+  - Only when no company is mentioned and inference from nearby messages is strong
+
+NEW OUTPUT COLUMNS (append AFTER all original columns, in this exact order)
+
+Ticker columns:
+- inferred_tickers
+- ticker_confidences
+- ticker_methods
+- ticker_evidence
+
+Formatting rules:
+- inferred_tickers: semicolon-separated uppercase tickers (e.g. "GME;AMC")
+- ticker_confidences: semicolon-separated real numbers in [0,1]
+- ticker_methods: explicit_mention | implicit_company_reference | context_inferred
+- ticker_evidence: semicolon-separated short snippets (≤12 words each)
+
+Score columns (ALL real numbers in [0,1]):
+- hype
+- positivity
+- negativity
+- overall_sentiment        (0 very negative, 0.5 neutral, 1 very positive)
+- sarcasm
+- irony
+- uncertainty
+- urgency
+- fomo
+- diamond_hands
+- paper_hands
+- call_to_action
+
+Boolean flags (use lowercase "true"/"false"):
+- contains_price_target
+- contains_options_talk
+- mentions_short_squeeze
+- mentions_gamma_squeeze
+- mentions_earnings
+- mentions_regulatory
+- non_english_or_mixed
+
+SCORING GUIDELINES
+- hype: excitement / viral energy (independent of positivity)
+- positivity / negativity: emotional valence
+- sarcasm: mockery / opposite-of-literal meaning
+- irony: broader incongruity or self-aware contradiction
+- uncertainty: hedging, speculation, low conviction
+- urgency: immediacy / time pressure
+- fomo: fear of missing out / chasing
+- diamond_hands: strong holding conviction
+- paper_hands: panic selling / exit signals
+- call_to_action: urging buy/sell/hold/options behavior
+
+FLAGS (true only if explicitly indicated)
+- contains_price_target: “to $X”, “PT 100”
+- contains_options_talk: calls, puts, strike, expiry, IV, gamma
+- mentions_short_squeeze: short interest, squeeze language
+- mentions_gamma_squeeze: gamma squeeze, dealer hedging
+- mentions_earnings: earnings, guidance, quarter
+- mentions_regulatory: SEC, halts, investigation
+- non_english_or_mixed: mostly non-English or heavily mixed
+
+PROCESSING STEPS
+1) Parse the CSV batch.
+2) Sort mentally by timestamp (created_dt or created_utc).
+3) For each row:
+   a) Build message_text from title + selftext.
+   b) Handle “[removed]” or empty selftext gracefully.
+   c) Identify explicit tickers.
+   d) Identify implicit references.
+   e) If none, infer context from nearby messages.
+   f) Assign tickers + confidence + method + evidence.
+   g) Assign scores and flags.
+4) Emit OUTPUT CSV:
+   - Header = input header + new columns
+   - Rows = input rows with appended values
+
+FEW-SHOT EXAMPLES (adapted to this dataset)
+
+EXAMPLE 1 — Explicit ticker in title
+INPUT_ROW:
+subreddit=wallstreetbets
+id=abc123
+created_dt=2021-01-25 14:03:00+00:00
+title="$GME is ripping 🚀"
+selftext="Load calls now"
+url=...
+
+OUTPUT_APPEND:
+inferred_tickers=GME
+ticker_confidences=0.94
+ticker_methods=explicit_mention
+ticker_evidence="$GME; Load calls"
+hype=0.95
+positivity=0.85
+negativity=0.05
+overall_sentiment=0.88
+sarcasm=0.05
+irony=0.05
+uncertainty=0.10
+urgency=0.85
+fomo=0.75
+diamond_hands=0.60
+paper_hands=0.05
+call_to_action=0.90
+contains_price_target=false
+contains_options_talk=true
+mentions_short_squeeze=false
+mentions_gamma_squeeze=false
+mentions_earnings=false
+mentions_regulatory=false
+non_english_or_mixed=false
+
+EXAMPLE 2 — Implicit reference
+title="The videogame retailer is not done"
+selftext="Still holding."
+
+→ inferred_tickers=GME
+→ ticker_methods=implicit_company_reference
+→ diamond_hands high, call_to_action moderate
+
+EXAMPLE 3 — Context inferred
+title="I’m not selling."
+selftext=""
+Nearby posts (same hour) repeatedly mention AMC.
+
+→ inferred_tickers=AMC
+→ ticker_methods=context_inferred
+→ ticker_confidences≈0.60–0.70
+
+EXAMPLE 4 — Ambiguous
+title="This is insane lol"
+selftext=""
+
+→ inferred_tickers=""
+→ scores near neutral
+→ no flags set
+
+END OF EXAMPLES
+
+NOW PROCESS THE REAL INPUT.
+Return ONLY the OUTPUT CSV (header + rows).
