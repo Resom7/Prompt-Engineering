@@ -1,15 +1,3 @@
-"""
-Script to fetch all listed US companies and create a dataset of the top 100 most volatile companies per day.
-
-Date Range: 2024-01-01 to 2025-05-20 (matching dataset_meme_reddit_historical_1)
-
-Volatility metrics calculated:
-- daily_change: Daily percentage change
-- rolling_vol_5d: 5-day rolling volatility
-- rolling_vol_10d: 10-day rolling volatility
-- rolling_vol_20d: 20-day rolling volatility
-"""
-
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -17,8 +5,6 @@ from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
-# ============================================================================
-# CONFIGURATION - CHANGE THIS TO SELECT VOLATILITY METRIC
 # ============================================================================
 # Options: 'daily_change', 'rolling_vol_5d', 'rolling_vol_10d', 'rolling_vol_20d'
 VOLATILITY_METRIC = 'rolling_vol_20d'
@@ -44,7 +30,7 @@ def get_us_stock_tickers():
 
     # Comprehensive list of US stocks across market caps and sectors
     # This includes S&P 500, Russell 1000, NASDAQ 100, and major mid/small caps
-    # Total: ~1500+ stocks covering the vast majority of US market capitalization
+    # Total: 1000+ stocks covering the vast majority of US market capitalization
     print("  Adding stocks from major indices and exchanges...")
 
     all_tickers = [
