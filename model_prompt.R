@@ -1,6 +1,6 @@
 ############################################################
 # Meme stock detection using Reddit (LLM sentiment/features)
-#################### Using Prompt 4C #######################
+#################### Using Prompt C4 #######################
 ############################################################
 
 library(tidyverse)
@@ -12,7 +12,7 @@ library(torch)
 
 set.seed(123)
 
-reddit_prompt_path <- "dataset_reddit"
+reddit_prompt_path <- "Prompts/Datasets/PromptC4.csv"
 price_path  <- "dataset_price_yahoo.csv"
 
 # ----------------------------------------------------------
