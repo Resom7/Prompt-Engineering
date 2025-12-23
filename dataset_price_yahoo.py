@@ -18,7 +18,7 @@ END_DATE = '2025-05-20'
 TOP_N = 100
 
 # Output file
-OUTPUT_FILE = f'price_yahoo_dataset.csv'
+OUTPUT_FILE = f'dataset_price_yahoo.csv'
 
 
 def get_us_stock_tickers():

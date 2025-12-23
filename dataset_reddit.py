@@ -20,7 +20,7 @@ TOTAL_PER_SUB = 5000      # target posts per subreddit (change if you like)
 # earliest date you care about (UTC). Older posts will not be fetched.
 EARLIEST_DATE = datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp()
 
-OUTPUT_CSV = "meme_reddit_historical.csv"
+OUTPUT_CSV = "dataset_reddit.csv"
 
 # ---------- FUNCTION ---------- #
 
