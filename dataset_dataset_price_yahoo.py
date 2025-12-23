@@ -10,7 +10,7 @@ warnings.filterwarnings('ignore')
 VOLATILITY_METRIC = 'rolling_vol_20d'
 # ============================================================================
 
-# Date range from dataset_meme_reddit_historical_1
+# Date range from dataset_reddit
 START_DATE = '2024-01-01'
 END_DATE = '2025-05-20'
 
@@ -18,7 +18,7 @@ END_DATE = '2025-05-20'
 TOP_N = 100
 
 # Output file
-OUTPUT_FILE = f'dataset_top100_volatile_stocks_{VOLATILITY_METRIC}.csv'
+OUTPUT_FILE = f'price_yahoo_dataset.csv'
 
 
 def get_us_stock_tickers():

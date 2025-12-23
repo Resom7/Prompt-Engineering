@@ -1,5 +1,6 @@
 ############################################################
 # Meme stock detection using Reddit (LLM sentiment/features)
+#################### Using Prompt 4C #######################
 ############################################################
 
 library(tidyverse)
@@ -11,8 +12,8 @@ library(torch)
 
 set.seed(123)
 
-reddit_path <- "~/Documents/PEE/LLM_dataset.csv"
-price_path  <- "~/Documents/PEE/price_yahoo_dataset(2).csv"
+reddit_prompt_path <- "dataset_reddit"
+price_path  <- "dataset_price_yahoo.csv"
 
 # ----------------------------------------------------------
 # Helpers
@@ -65,8 +66,8 @@ tradeable_tickers <- unique(price_df$ticker)
 # 2) Reddit: clean text + date
 # ----------------------------------------------------------
 
-load_and_clean_reddit <- function(reddit_path) {
-  df <- readr::read_csv(reddit_path, show_col_types = FALSE)
+load_and_clean_reddit <- function(reddit_prompt_path) {
+  df <- readr::read_csv(reddit_prompt_path, show_col_types = FALSE)
   
   if (!"created_dt" %in% names(df) && "created_utc" %in% names(df)) {
     df <- df %>% mutate(created_dt = as_datetime(created_utc, tz = "UTC"))
@@ -83,7 +84,7 @@ load_and_clean_reddit <- function(reddit_path) {
     filter(!is.na(text), nchar(text) >= 10)
 }
 
-reddit_df <- load_and_clean_reddit(reddit_path)
+reddit_df <- load_and_clean_reddit(reddit_prompt_path)
 
 # ----------------------------------------------------------
 # 3) Ticker extraction from Reddit posts
