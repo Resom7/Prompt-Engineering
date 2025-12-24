@@ -2,6 +2,20 @@
 
 A machine learning project that uses Large Language Models (LLMs) to extract sentiment features from Reddit posts and predict meme stock events.
 
+## Installation
+
+### Python Dependencies
+Run the installation script:
+```bash
+python install_packages.py
+```
+
+### R Dependencies
+Run the installation script in R or RStudio:
+```r
+source("install_packages.R")
+```
+
 ## Project Structure
 
 ### Main File
